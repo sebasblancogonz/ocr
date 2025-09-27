@@ -7,6 +7,7 @@ import numpy as np
 from pdf2image import convert_from_bytes
 import io
 import re
+import subprocess
 from typing import Dict, Any
 import os
 from dotenv import load_dotenv
@@ -154,7 +155,26 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """Health check endpoint para verificar que el servicio está funcionando"""
+    try:
+        # Verificar que Tesseract está disponible
+        import subprocess
+        result = subprocess.run([pytesseract.pytesseract.tesseract_cmd, '--version'], 
+                              capture_output=True, text=True, timeout=5)
+        tesseract_ok = result.returncode == 0
+        
+        return {
+            "status": "healthy",
+            "tesseract_available": tesseract_ok,
+            "service": "OCR Service",
+            "version": "1.0.0"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "service": "OCR Service"
+        }
 
 @app.post("/ocr/process")
 async def process_ocr(file: UploadFile = File(...)):
