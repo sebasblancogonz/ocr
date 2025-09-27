@@ -12,13 +12,17 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-spa \
     tesseract-ocr-eng \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
+    libgthread-2.0-0 \
+    libfontconfig1 \
+    libxss1 \
     poppler-utils \
+    python3-opencv \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /tmp/* \
