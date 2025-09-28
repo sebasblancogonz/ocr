@@ -1,8 +1,4 @@
-def detect_document_type(self, text: str) -> DocumentType:
-        """Detectar tipo de documento basado en palabras clave"""
-        text_lower = text.lower()
-        
-        # Detectar facturas de servicios públicos primfrom fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pytesseract
