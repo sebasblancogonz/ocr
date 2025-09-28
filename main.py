@@ -1,4 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
+def detect_document_type(self, text: str) -> DocumentType:
+        """Detectar tipo de documento basado en palabras clave"""
+        text_lower = text.lower()
+        
+        # Detectar facturas de servicios públicos primfrom fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pytesseract
@@ -20,6 +24,8 @@ import logging
 from enum import Enum
 import tempfile
 from pathlib import Path
+# Importar el procesador especializado para facturas eléctricas
+# from electricity_bill_processor import ElectricityBillProcessor, ElectricitySupplier
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +71,8 @@ class DocumentType(str, Enum):
     INVOICE = "invoice"
     RECEIPT = "receipt"
     TICKET = "ticket"
+    ELECTRICITY_BILL = "electricity_bill"
+    GAS_BILL = "gas_bill"
     UNKNOWN = "unknown"
 
 class ProcessingQuality(str, Enum):
@@ -76,6 +84,41 @@ class OCRProcessor:
     def __init__(self):
         self.supported_languages = ['spa', 'eng', 'fra', 'deu', 'ita', 'por']
         self.document_patterns = self._load_document_patterns()
+        self.electricity_patterns = self._load_electricity_patterns()
+    
+    def _load_electricity_patterns(self) -> Dict:
+        """Patrones específicos para facturas eléctricas españolas"""
+        return {
+            'general': {
+                'invoice_number': [
+                    r'(?:n[°ºo]\s*factura|factura|invoice)[\s:]*([A-Z0-9\-\/]+)',
+                    r'(?:número|num\.|n[°ºo])[\s:]*([A-Z0-9\-\/]+)',
+                ],
+                'cups': r'(?:CUPS|cups)[\s:]*([A-Z]{2}\d{4}\s*\d{10}\s*[A-Z]{2}\d{1}[A-Z]{1})',
+                'billing_period': [
+                    r'(?:periodo|período)[\s:]*(?:del?\s*)?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s*(?:a|al|-)\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+                    r'desde\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s*hasta\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})',
+                ],
+                'total_amount': [
+                    r'total\s*a\s*pagar[\s:]*(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?:\s*€)?',
+                    r'(\d{1,3}[.,]\d{2})\s*€[\s]*total'
+                ],
+                'electricity_amount': r'(?:consumo\s*)?electricidad[\s:]*(?:€\s*)?(\d{1,3}[.,]\d{2})(?:\s*€)?',
+                'gas_amount': r'(?:consumo\s*)?gas[\s:]*(?:€\s*)?(\d{1,3}[.,]\d{2})(?:\s*€)?',
+                'vat_amount': r'IVA[\s:]*(?:€\s*)?(\d{1,3}[.,]\d{2})(?:\s*€)?',
+                'services_amount': r'servicios[\s:]*(?:€\s*)?(\d{1,3}[.,]\d{2})(?:\s*€)?',
+                'kwh_consumed': r'(\d{1,5})\s*kWh',
+                'contracted_power': r'potencia\s*contratada[\s:]*(\d+[.,]\d+)\s*kW',
+            },
+            'naturgy': {
+                'customer_greeting': r'Hola,?\s*([^\n]+)',
+                'total_pattern': r'Total\s*a\s*pagar[\s:]*(\d{1,3}[.,]\d{2})\s*€',
+                'gas_pattern': r'Gas[\s:]*(\d{1,3}[.,]\d{2})\s*€',
+                'electricity_pattern': r'Electricidad[\s:]*(\d{1,3}[.,]\d{2})\s*€',
+                'services_pattern': r'Servicios[\s:]*(\d{1,3}[.,]\d{2})\s*€',
+                'iva_pattern': r'IVA[\s:]*(\d{1,3}[.,]\d{2})\s*€'
+            }
+        }
         
     def _load_document_patterns(self) -> Dict:
         """Cargar patrones de extracción específicos para España y Europa"""
@@ -104,6 +147,24 @@ class OCRProcessor:
         """Detectar tipo de documento basado en palabras clave"""
         text_lower = text.lower()
         
+        # Detectar facturas de servicios públicos primero
+        electricity_keywords = ['electricidad', 'electricity', 'kwh', 'potencia contratada', 
+                               'cups', 'naturgy', 'endesa', 'iberdrola', 'edp', 
+                               'consumo eléctrico', 'energía']
+        gas_keywords = ['gas natural', 'gas', 'm3', 'metro cúbico', 'consumo gas']
+        
+        # Verificar si es factura eléctrica
+        if any(keyword in text_lower for keyword in electricity_keywords):
+            # Verificar si también tiene gas (factura combinada)
+            if any(keyword in text_lower for keyword in gas_keywords):
+                return DocumentType.ELECTRICITY_BILL  # Las combinadas las tratamos como eléctricas
+            return DocumentType.ELECTRICITY_BILL
+        
+        # Verificar si es solo gas
+        if any(keyword in text_lower for keyword in gas_keywords):
+            return DocumentType.GAS_BILL
+        
+        # Otros tipos de documentos
         invoice_keywords = ['factura', 'invoice', 'proforma', 'albaran']
         receipt_keywords = ['recibo', 'receipt', 'justificante', 'comprobante']
         ticket_keywords = ['ticket', 'tique', 'nota', 'vale']
@@ -248,6 +309,11 @@ class OCRProcessor:
     def extract_structured_data(self, text: str, doc_type: DocumentType) -> Dict[str, Any]:
         """Extracción avanzada de datos estructurados"""
         
+        # Si es factura eléctrica, usar extractor especializado
+        if doc_type in [DocumentType.ELECTRICITY_BILL, DocumentType.GAS_BILL]:
+            return self.extract_electricity_bill_data(text, doc_type)
+        
+        # Para otros tipos de documento, usar el extractor general
         patterns = self.document_patterns['spanish']
         extracted = {
             'document_type': doc_type.value,
@@ -446,6 +512,256 @@ class OCRProcessor:
             score += scoring_rules['items']
         
         return min(score / max_score * 100, 100)
+    
+    def extract_electricity_bill_data(self, text: str, doc_type: DocumentType) -> Dict[str, Any]:
+        """Extracción especializada para facturas de electricidad y gas"""
+        
+        # Detectar proveedor
+        text_lower = text.lower()
+        supplier = 'unknown'
+        
+        suppliers = {
+            'naturgy': ['naturgy', 'naturgy iberia', 'gas natural'],
+            'endesa': ['endesa', 'endesa energía'],
+            'iberdrola': ['iberdrola', 'iberdrola clientes'],
+            'edp': ['edp', 'edp comercializadora'],
+            'repsol': ['repsol', 'repsol luz'],
+            'totalenergies': ['totalenergies', 'total energies']
+        }
+        
+        for supplier_name, keywords in suppliers.items():
+            if any(keyword in text_lower for keyword in keywords):
+                supplier = supplier_name
+                break
+        
+        # Estructura de datos para factura eléctrica
+        extracted = {
+            'document_type': doc_type.value,
+            'supplier': supplier,
+            'extraction_timestamp': datetime.now().isoformat(),
+            'billing_info': {},
+            'consumption': {},
+            'amounts': {},
+            'supply_info': {},
+            'breakdown': {},
+            'financial': {},
+            'identification': {},
+            'dates': []
+        }
+        
+        # Usar patrones específicos del proveedor si está identificado
+        patterns = self.electricity_patterns['general'].copy()
+        if supplier in self.electricity_patterns:
+            supplier_patterns = self.electricity_patterns[supplier]
+            patterns.update(supplier_patterns)
+        
+        # Extraer CUPS (crítico en facturas eléctricas)
+        cups_match = re.search(patterns.get('cups', ''), text, re.IGNORECASE)
+        if cups_match:
+            extracted['supply_info']['cups'] = cups_match.group(1).replace(' ', '')
+            extracted['identification']['cups'] = cups_match.group(1).replace(' ', '')
+        
+        # Extraer número de factura
+        for pattern in [patterns.get('invoice_number')] if isinstance(patterns.get('invoice_number'), str) else patterns.get('invoice_number', []):
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                extracted['billing_info']['invoice_number'] = match.group(1)
+                extracted['identification']['invoice_number'] = match.group(1)
+                break
+        
+        # Extraer periodo de facturación
+        for pattern in patterns.get('billing_period', []):
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                start_date = self._parse_date_flexible(match.group(1))
+                end_date = self._parse_date_flexible(match.group(2))
+                extracted['billing_info']['period_start'] = start_date
+                extracted['billing_info']['period_end'] = end_date
+                extracted['dates'] = [start_date, end_date]
+                break
+        
+        # Extraer importes según el proveedor
+        if supplier == 'naturgy':
+            # Patrones específicos de Naturgy
+            total_match = re.search(patterns.get('total_pattern', ''), text, re.IGNORECASE)
+            if total_match:
+                total = self._parse_amount(total_match.group(1))
+                extracted['amounts']['total'] = total
+                extracted['financial']['total'] = total
+            
+            gas_match = re.search(patterns.get('gas_pattern', ''), text, re.IGNORECASE)
+            if gas_match:
+                gas = self._parse_amount(gas_match.group(1))
+                extracted['amounts']['gas'] = gas
+                extracted['breakdown']['gas'] = gas
+            
+            elec_match = re.search(patterns.get('electricity_pattern', ''), text, re.IGNORECASE)
+            if elec_match:
+                electricity = self._parse_amount(elec_match.group(1))
+                extracted['amounts']['electricity'] = electricity
+                extracted['breakdown']['electricity'] = electricity
+            
+            iva_match = re.search(patterns.get('iva_pattern', ''), text, re.IGNORECASE)
+            if iva_match:
+                vat = self._parse_amount(iva_match.group(1))
+                extracted['amounts']['vat'] = vat
+                extracted['financial']['vat_amount'] = vat
+            
+            services_match = re.search(patterns.get('services_pattern', ''), text, re.IGNORECASE)
+            if services_match:
+                services = self._parse_amount(services_match.group(1))
+                extracted['amounts']['services'] = services
+                extracted['breakdown']['services'] = services
+        else:
+            # Patrones generales
+            for pattern in patterns.get('total_amount', []):
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    total = self._parse_amount(match.group(1))
+                    extracted['amounts']['total'] = total
+                    extracted['financial']['total'] = total
+                    break
+            
+            # Electricidad
+            elec_match = re.search(patterns.get('electricity_amount', ''), text, re.IGNORECASE)
+            if elec_match:
+                electricity = self._parse_amount(elec_match.group(1))
+                extracted['amounts']['electricity'] = electricity
+                extracted['breakdown']['electricity'] = electricity
+            
+            # Gas
+            gas_match = re.search(patterns.get('gas_amount', ''), text, re.IGNORECASE)
+            if gas_match:
+                gas = self._parse_amount(gas_match.group(1))
+                extracted['amounts']['gas'] = gas
+                extracted['breakdown']['gas'] = gas
+            
+            # IVA
+            vat_match = re.search(patterns.get('vat_amount', ''), text, re.IGNORECASE)
+            if vat_match:
+                vat = self._parse_amount(vat_match.group(1))
+                extracted['amounts']['vat'] = vat
+                extracted['financial']['vat_amount'] = vat
+        
+        # Extraer consumo en kWh
+        kwh_match = re.search(patterns.get('kwh_consumed', ''), text, re.IGNORECASE)
+        if kwh_match:
+            extracted['consumption']['kwh'] = int(kwh_match.group(1))
+        
+        # Extraer potencia contratada
+        power_match = re.search(patterns.get('contracted_power', ''), text, re.IGNORECASE)
+        if power_match:
+            extracted['consumption']['contracted_power_kw'] = float(power_match.group(1).replace(',', '.'))
+        
+        # Calcular base imponible si tenemos total e IVA
+        if extracted.get('financial', {}).get('total') and extracted.get('financial', {}).get('vat_amount'):
+            base = extracted['financial']['total'] - extracted['financial']['vat_amount']
+            extracted['financial']['base_amount'] = round(base, 2)
+        
+        # Buscar dirección del suministro
+        address_pattern = r'(?:dirección|direccion)\s*(?:de\s*)?suministro[\s:]*([^\n]+(?:\n[^\n]+)?)'
+        address_match = re.search(address_pattern, text, re.IGNORECASE)
+        if address_match:
+            extracted['supply_info']['address'] = address_match.group(1).strip()
+        
+        # Calcular score de calidad específico para facturas eléctricas
+        extracted['quality_score'] = self._calculate_electricity_quality_score(extracted)
+        
+        return extracted
+    
+    def _parse_amount(self, amount_str: str) -> float:
+        """Convertir string de importe a float"""
+        amount_str = amount_str.strip().replace(' ', '')
+        
+        # Manejar formato europeo (1.234,56) o americano (1,234.56)
+        if '.' in amount_str and ',' in amount_str:
+            # Determinar cuál es el separador decimal
+            if amount_str.rindex(',') > amount_str.rindex('.'):
+                # Formato europeo: punto para miles, coma para decimales
+                amount_str = amount_str.replace('.', '').replace(',', '.')
+            else:
+                # Formato americano: coma para miles, punto para decimales
+                amount_str = amount_str.replace(',', '')
+        elif ',' in amount_str:
+            # Solo coma, asumir que es decimal
+            amount_str = amount_str.replace(',', '.')
+        
+        try:
+            return float(amount_str)
+        except ValueError:
+            return 0.0
+    
+    def _parse_date_flexible(self, date_str: str) -> str:
+        """Parser de fecha más flexible"""
+        date_str = date_str.strip()
+        
+        # Formatos comunes en facturas españolas
+        date_formats = [
+            '%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y',
+            '%d/%m/%y', '%d-%m-%y', '%d.%m.%y',
+            '%d %m %Y', '%d %b %Y', '%d %B %Y'
+        ]
+        
+        for fmt in date_formats:
+            try:
+                date_obj = datetime.strptime(date_str, fmt)
+                if date_obj.year < 100:
+                    date_obj = date_obj.replace(year=2000 + date_obj.year if date_obj.year < 50 else 1900 + date_obj.year)
+                return date_obj.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+        
+        return date_str
+    
+    def _calculate_electricity_quality_score(self, data: Dict) -> float:
+        """Score de calidad específico para facturas eléctricas"""
+        score = 0
+        
+        # Criterios de puntuación
+        scoring = {
+            'invoice_number': 10,
+            'total': 20,
+            'cups': 15,
+            'period_dates': 10,
+            'supplier': 5,
+            'electricity_amount': 10,
+            'gas_amount': 5,
+            'vat': 10,
+            'consumption_kwh': 10,
+            'contracted_power': 5
+        }
+        
+        if data.get('billing_info', {}).get('invoice_number'):
+            score += scoring['invoice_number']
+        
+        if data.get('amounts', {}).get('total') or data.get('financial', {}).get('total'):
+            score += scoring['total']
+        
+        if data.get('supply_info', {}).get('cups'):
+            score += scoring['cups']
+        
+        if data.get('billing_info', {}).get('period_start') and data.get('billing_info', {}).get('period_end'):
+            score += scoring['period_dates']
+        
+        if data.get('supplier') and data.get('supplier') != 'unknown':
+            score += scoring['supplier']
+        
+        if data.get('amounts', {}).get('electricity'):
+            score += scoring['electricity_amount']
+        
+        if data.get('amounts', {}).get('gas'):
+            score += scoring['gas_amount']
+        
+        if data.get('amounts', {}).get('vat'):
+            score += scoring['vat']
+        
+        if data.get('consumption', {}).get('kwh'):
+            score += scoring['consumption_kwh']
+        
+        if data.get('consumption', {}).get('contracted_power_kw'):
+            score += scoring['contracted_power']
+        
+        return min(score, 100)
 
 class SimpleCache:
     """Cache simple basado en archivos"""
@@ -980,6 +1296,135 @@ async def validate_document(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error validando documento: {str(e)}")
+
+@app.post("/ocr/process-utility-bill")
+async def process_utility_bill(
+    file: UploadFile = File(...),
+    quality: ProcessingQuality = Query(ProcessingQuality.HIGH, description="Calidad de procesamiento (HIGH recomendado para facturas)"),
+    extract_consumption_data: bool = Query(True, description="Extraer datos de consumo histórico")
+):
+    """
+    Endpoint especializado para procesar facturas de servicios públicos (electricidad, gas).
+    Optimizado para Naturgy, Endesa, Iberdrola, EDP, etc.
+    """
+    
+    # Validar tipo de archivo
+    if not file.content_type:
+        raise HTTPException(status_code=400, detail="Tipo de archivo no especificado")
+    
+    allowed_types = ['image/jpeg', 'image/png', 'image/tiff', 'image/bmp', 'application/pdf']
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipo de archivo no soportado: {file.content_type}"
+        )
+    
+    try:
+        content = await file.read()
+        
+        # Validar tamaño
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024:.1f}MB"
+            )
+        
+        start_time = datetime.now()
+        
+        # Procesar imagen o PDF con alta calidad para mejor extracción
+        if file.content_type.startswith('image/'):
+            image = Image.open(io.BytesIO(content))
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            text, confidence = ocr_processor.extract_text_from_image(image, quality)
+        elif file.content_type == 'application/pdf':
+            text, confidence = ocr_processor.extract_text_from_pdf(content, quality)
+        
+        # Detectar tipo de documento
+        doc_type = ocr_processor.detect_document_type(text)
+        
+        # Validar que es una factura de servicios
+        if doc_type not in [DocumentType.ELECTRICITY_BILL, DocumentType.GAS_BILL]:
+            # Intentar detectar si es factura de servicios aunque no se detectó inicialmente
+            if any(word in text.lower() for word in ['cups', 'kwh', 'potencia', 'naturgy', 'endesa', 'iberdrola']):
+                doc_type = DocumentType.ELECTRICITY_BILL
+            else:
+                logger.warning(f"Documento no es factura de servicios: {doc_type}")
+        
+        # Extraer datos especializados
+        extracted_data = ocr_processor.extract_electricity_bill_data(text, doc_type)
+        
+        # Validación específica para facturas de servicios
+        validation = {
+            'has_cups': bool(extracted_data.get('supply_info', {}).get('cups')),
+            'has_invoice_number': bool(extracted_data.get('billing_info', {}).get('invoice_number')),
+            'has_period': bool(
+                extracted_data.get('billing_info', {}).get('period_start') and 
+                extracted_data.get('billing_info', {}).get('period_end')
+            ),
+            'has_total': bool(extracted_data.get('amounts', {}).get('total')),
+            'has_breakdown': bool(
+                extracted_data.get('amounts', {}).get('electricity') or 
+                extracted_data.get('amounts', {}).get('gas')
+            ),
+            'has_vat': bool(extracted_data.get('amounts', {}).get('vat')),
+            'supplier_detected': extracted_data.get('supplier') != 'unknown'
+        }
+        
+        # Calcular validez
+        is_valid = sum([
+            validation['has_invoice_number'],
+            validation['has_total'],
+            validation['has_period'] or validation['has_cups']  # Al menos uno de estos
+        ]) >= 2
+        
+        # Tiempo de procesamiento
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        # Preparar respuesta con formato específico para facturas de servicios
+        result = {
+            "success": True,
+            "filename": file.filename,
+            "document_type": doc_type.value,
+            "supplier": extracted_data.get('supplier', 'unknown'),
+            "validation": {
+                "is_valid": is_valid,
+                "details": validation,
+                "quality_score": extracted_data.get('quality_score', 0),
+                "missing_fields": [k for k, v in validation.items() if not v]
+            },
+            "billing_information": {
+                "invoice_number": extracted_data.get('billing_info', {}).get('invoice_number'),
+                "period_start": extracted_data.get('billing_info', {}).get('period_start'),
+                "period_end": extracted_data.get('billing_info', {}).get('period_end'),
+                "cups": extracted_data.get('supply_info', {}).get('cups')
+            },
+            "amounts": {
+                "total": extracted_data.get('amounts', {}).get('total'),
+                "electricity": extracted_data.get('amounts', {}).get('electricity'),
+                "gas": extracted_data.get('amounts', {}).get('gas'),
+                "vat": extracted_data.get('amounts', {}).get('vat'),
+                "services": extracted_data.get('amounts', {}).get('services'),
+                "base_amount": extracted_data.get('financial', {}).get('base_amount')
+            },
+            "consumption": extracted_data.get('consumption', {}),
+            "metrics": {
+                "ocr_confidence": round(confidence, 2),
+                "extraction_quality": round(extracted_data.get('quality_score', 0), 2),
+                "processing_time": round(processing_time, 3),
+                "quality_setting": quality.value
+            },
+            "raw_text": text if len(text) < 5000 else text[:5000] + "...",
+            "full_extraction": extracted_data
+        }
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error procesando factura de servicios: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando factura: {str(e)}")
 
 # Middleware para logging
 @app.middleware("http")
