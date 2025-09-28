@@ -175,28 +175,70 @@ class OCRProcessor:
             return DocumentType.UNKNOWN
     
     def preprocess_image(self, image: np.ndarray, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> np.ndarray:
-        """Preprocesar imagen según calidad solicitada"""
+        """Preprocesar imagen según calidad solicitada con mejoras avanzadas"""
         
         # Convertir a escala de grises
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
-            gray = image
+            gray = image.copy()
         
+        # Verificar y ajustar el tamaño de la imagen
+        height, width = gray.shape
+        if height < 300 or width < 300:
+            # Redimensionar imagen pequeña para mejor OCR
+            scale_factor = max(500/width, 500/height)
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
         if quality == ProcessingQuality.FAST:
-            # Procesamiento mínimo para velocidad
-            return gray
+            # Procesamiento básico pero efectivo
+            # Mejorar contraste simple
+            enhanced = cv2.equalizeHist(gray)
+            # Binarización básica
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return binary
         
-        # Reducir ruido
-        denoised = cv2.fastNlMeansDenoising(gray, h=10)
+        # Reducir ruido con parámetros ajustados
+        denoised = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
+        
+        # Detectar y corregir rotación automáticamente
+        try:
+            # Detectar líneas para determinar rotación
+            edges = cv2.Canny(denoised, 50, 150, apertureSize=3)
+            lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=100)
+            
+            if lines is not None and len(lines) > 5:
+                # Calcular ángulo promedio de las líneas
+                angles = []
+                for rho, theta in lines[:10]:  # Usar solo las primeras 10 líneas
+                    angle = (theta * 180 / np.pi) - 90
+                    if abs(angle) < 45:  # Solo ángulos razonables
+                        angles.append(angle)
+                
+                if angles:
+                    rotation_angle = np.median(angles)
+                    if abs(rotation_angle) > 0.5:  # Solo rotar si hay desviación significativa
+                        (h, w) = denoised.shape[:2]
+                        center = (w // 2, h // 2)
+                        M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                        denoised = cv2.warpAffine(denoised, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        except:
+            pass  # Si falla la detección de rotación, continuar sin rotar
         
         if quality == ProcessingQuality.BALANCED:
-            # Mejorar contraste
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            # Mejorar contraste adaptativo
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
             enhanced = clahe.apply(denoised)
             
-            # Binarización
+            # Binarización mejorada
             _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Limpieza morfológica
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            
             return binary
         
         elif quality == ProcessingQuality.HIGH:
@@ -231,35 +273,99 @@ class OCRProcessor:
             return binary
     
     def extract_text_from_image(self, image: Image.Image, quality: ProcessingQuality = ProcessingQuality.BALANCED, languages: str = None) -> Tuple[str, float]:
-        """Extraer texto con medición de confianza"""
+        """Extraer texto con medición de confianza mejorada"""
         
         # Convertir PIL a OpenCV
         opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         
-        # Preprocesar
+        # Preprocesar con mejoras
         processed = self.preprocess_image(opencv_image, quality)
         
-        # Configuración OCR según calidad
+        # Configuración OCR mejorada según calidad
         psm_modes = {
-            ProcessingQuality.FAST: 3,      # Automatic page segmentation
-            ProcessingQuality.BALANCED: 6,   # Uniform block of text
-            ProcessingQuality.HIGH: 11       # Sparse text
+            ProcessingQuality.FAST: 6,       # Uniform block of text
+            ProcessingQuality.BALANCED: 3,   # Automatic page segmentation
+            ProcessingQuality.HIGH: 1        # Automatic page segmentation with OSD
         }
         
         lang = languages or TESSERACT_LANGUAGES
-        custom_config = f'--oem 3 --psm {psm_modes[quality]} -l {lang}'
         
-        # OCR con datos de confianza
-        data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
+        # Configuración más robusta
+        base_config = f'--oem 3 --psm {psm_modes[quality]} -l {lang}'
         
-        # Calcular confianza promedio
-        confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
-        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+        # Parámetros adicionales para mejorar la detección
+        if quality == ProcessingQuality.HIGH:
+            # Configuración más agresiva para alta calidad
+            whitelist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ€.,;:!?()[]{}'\\-+*/=@#$%&|<>^_`~ "
+            custom_config = f'{base_config} -c tessedit_char_whitelist={whitelist}'
+        else:
+            custom_config = base_config
         
-        # Extraer texto
-        text = pytesseract.image_to_string(processed, config=custom_config)
+        try:
+            # Intentar OCR múltiple con diferentes configuraciones si es necesario
+            text = pytesseract.image_to_string(processed, config=custom_config)
+            
+            # Si el texto es muy corto o contiene muchos caracteres raros, intentar con otra configuración
+            if len(text.strip()) < 10 or self._has_too_many_invalid_chars(text):
+                # Intentar con modo PSM diferente
+                fallback_psm = 6 if psm_modes[quality] != 6 else 3
+                fallback_config = f'--oem 3 --psm {fallback_psm} -l {lang}'
+                fallback_text = pytesseract.image_to_string(processed, config=fallback_config)
+                
+                # Usar el texto más largo y con menos caracteres inválidos
+                if len(fallback_text.strip()) > len(text.strip()) and not self._has_too_many_invalid_chars(fallback_text):
+                    text = fallback_text
+                    custom_config = fallback_config
+            
+            # OCR con datos de confianza usando la configuración final
+            data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
+            
+            # Calcular confianza promedio (solo palabras con confianza > 30)
+            confidences = [int(conf) for conf in data['conf'] if int(conf) > 30]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            # Limpiar texto de caracteres extraños
+            cleaned_text = self._clean_extracted_text(text)
+            
+            return cleaned_text.strip(), avg_confidence
+            
+        except Exception as e:
+            logger.error(f"Error en extracción OCR: {e}")
+            return "", 0.0
+    
+    def _has_too_many_invalid_chars(self, text: str) -> bool:
+        """Verificar si el texto tiene demasiados caracteres inválidos"""
+        if not text:
+            return True
+            
+        # Contar caracteres válidos vs inválidos
+        valid_chars = sum(1 for c in text if c.isalnum() or c.isspace() or c in '.,;:!?()[]{}"\'-+*/=@#$%&|\\<>^_`~€')
+        total_chars = len(text)
         
-        return text.strip(), avg_confidence
+        if total_chars == 0:
+            return True
+            
+        valid_ratio = valid_chars / total_chars
+        return valid_ratio < 0.7  # Si menos del 70% son caracteres válidos
+    
+    def _clean_extracted_text(self, text: str) -> str:
+        """Limpiar texto extraído de caracteres problemáticos"""
+        if not text:
+            return text
+            
+        # Reemplazar secuencias de caracteres problemáticos comunes
+        replacements = {
+            r'[^\w\s.,;:!?()[\]{}"\'\-+*/=@#$%&|\\<>^_`~€À-ÿ]': ' ',  # Caracteres no válidos
+            r'\s+': ' ',  # Múltiples espacios
+            r'([A-Za-z])\s+([A-Za-z])(?=\s|$)': r'\1\2',  # Letras separadas por espacios
+            r'(\d)\s+(\d)': r'\1\2',  # Números separados
+        }
+        
+        cleaned = text
+        for pattern, replacement in replacements.items():
+            cleaned = re.sub(pattern, replacement, cleaned)
+        
+        return cleaned.strip()
     
     def extract_text_from_pdf(self, pdf_bytes: bytes, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> Tuple[str, float]:
         """Extraer texto de PDF con procesamiento paralelo"""
@@ -1292,6 +1398,96 @@ async def validate_document(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error validando documento: {str(e)}")
+
+@app.post("/ocr/debug")
+async def debug_ocr(
+    file: UploadFile = File(...),
+    save_processed_image: bool = Query(False, description="Guardar imagen procesada para debug")
+):
+    """
+    Endpoint de debug para diagnosticar problemas de OCR.
+    Devuelve información detallada del procesamiento.
+    """
+    
+    if not file.content_type or not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="Solo se admiten imágenes para debug")
+    
+    try:
+        content = await file.read()
+        image = Image.open(io.BytesIO(content))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Información original de la imagen
+        original_info = {
+            "size": image.size,
+            "mode": image.mode,
+            "format": getattr(image, 'format', 'Unknown'),
+            "has_transparency": image.mode in ('RGBA', 'LA', 'P')
+        }
+        
+        # Convertir para procesamiento
+        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        
+        # Probar diferentes calidades y configuraciones
+        results = {}
+        
+        for quality in [ProcessingQuality.FAST, ProcessingQuality.BALANCED, ProcessingQuality.HIGH]:
+            processed = ocr_processor.preprocess_image(opencv_image, quality)
+            
+            # Diferentes modos PSM
+            for psm in [3, 6, 8, 11]:
+                config_name = f"{quality.value}_psm{psm}"
+                config = f'--oem 3 --psm {psm} -l {TESSERACT_LANGUAGES}'
+                
+                try:
+                    text = pytesseract.image_to_string(processed, config=config)
+                    data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
+                    
+                    # Calcular estadísticas
+                    confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+                    avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+                    
+                    results[config_name] = {
+                        "text": text[:500] + "..." if len(text) > 500 else text,
+                        "text_length": len(text),
+                        "confidence": round(avg_confidence, 2),
+                        "word_count": len([w for w in data['text'] if w.strip()]),
+                        "config": config
+                    }
+                except Exception as e:
+                    results[config_name] = {"error": str(e)}
+        
+        # Encontrar mejor resultado
+        best_result = None
+        best_score = 0
+        
+        for name, result in results.items():
+            if 'error' not in result:
+                # Score = confianza * longitud de texto
+                score = result['confidence'] * result['text_length']
+                if score > best_score:
+                    best_score = score
+                    best_result = name
+        
+        return {
+            "filename": file.filename,
+            "original_image": original_info,
+            "processing_results": results,
+            "best_configuration": best_result,
+            "recommendations": {
+                "image_too_small": image.size[0] < 500 or image.size[1] < 500,
+                "low_confidence_detected": best_score < 1000,
+                "suggested_improvements": [
+                    "Aumentar resolución de la imagen" if image.size[0] < 500 else None,
+                    "Mejorar iluminación y contraste" if best_score < 500 else None,
+                    "Verificar que el texto esté derecho" if best_score < 800 else None
+                ]
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en debug: {str(e)}")
 
 @app.post("/ocr/process-utility-bill")
 async def process_utility_bill(
