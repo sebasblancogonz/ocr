@@ -1,21 +1,38 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance
 import cv2
 import numpy as np
 from pdf2image import convert_from_bytes
 import io
 import re
 import subprocess
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional, Tuple
 import os
 from dotenv import load_dotenv
+from datetime import datetime
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from enum import Enum
+import tempfile
+from pathlib import Path
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Cargar variables de entorno
 load_dotenv()
 
-app = FastAPI(title="Cakely OCR Service", version="1.0.0")
+app = FastAPI(
+    title="Cakely OCR Service", 
+    version="2.0.0",
+    description="Servicio avanzado de OCR para procesamiento de facturas y tickets"
+)
 
 # Configurar CORS
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -27,169 +44,573 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configurar ruta de Tesseract (ajustar según tu instalación)
-# En Ubuntu/Debian: apt-get install tesseract-ocr tesseract-ocr-spa
-# En macOS: brew install tesseract tesseract-lang
+# Configuraciones
 tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-# Configuraciones desde variables de entorno
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB por defecto
-MAX_PAGES_PDF = int(os.getenv("MAX_PAGES_PDF", "3"))
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10MB
+MAX_PAGES_PDF = int(os.getenv("MAX_PAGES_PDF", "5"))
 TESSERACT_LANGUAGES = os.getenv("TESSERACT_LANGUAGES", "spa+eng")
+ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/ocr_cache"))
+
+# Crear directorio de caché si no existe
+if ENABLE_CACHE:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Pool de threads para procesamiento paralelo
+executor = ThreadPoolExecutor(max_workers=4)
+
+class DocumentType(str, Enum):
+    INVOICE = "invoice"
+    RECEIPT = "receipt"
+    TICKET = "ticket"
+    UNKNOWN = "unknown"
+
+class ProcessingQuality(str, Enum):
+    FAST = "fast"
+    BALANCED = "balanced"
+    HIGH = "high"
 
 class OCRProcessor:
     def __init__(self):
-        self.supported_languages = ['spa', 'eng']  # Español e Inglés
+        self.supported_languages = ['spa', 'eng', 'fra', 'deu', 'ita', 'por']
+        self.document_patterns = self._load_document_patterns()
         
-    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
-        """Preprocesar imagen para mejorar OCR"""
+    def _load_document_patterns(self) -> Dict:
+        """Cargar patrones de extracción específicos para España y Europa"""
+        return {
+            'spanish': {
+                'amount': r'(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?:\s*€|\s*EUR)?',
+                'tax_id': r'(?:CIF|NIF|VAT|DNI)[:\s]*([A-Z]\d{7,8}[A-Z0-9]|\d{8}[A-Z])',
+                'date': r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})',
+                'invoice_number': r'(?:factura|n[°ºo]|número|num\.?)[:\s]*([A-Z0-9\-\/]+)',
+                'vat_rate': r'IVA[:\s]*(\d{1,2})[%\s]',
+                'vat_amount': r'IVA[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
+                'base_amount': r'(?:base\s*imponible|subtotal)[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
+                'total': r'(?:total|importe\s*total|total\s*factura)[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
+                'iban': r'(?:IBAN|iban)[:\s]*([A-Z]{2}\d{2}[\s]?(?:\d{4}[\s]?){5})',
+                'payment_method': r'(?:forma\s*de\s*pago|método\s*pago)[:\s]*([A-Za-z\s]+)',
+            },
+            'european': {
+                'amount': r'(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?:\s*€|\s*EUR)?',
+                'vat_number': r'(?:VAT|USt-?IdNr\.?|TVA|P\.?\s*IVA)[:\s]*([A-Z]{2}[A-Z0-9]+)',
+                'date_eu': r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})',
+                'date_iso': r'(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})',
+            }
+        }
+    
+    def detect_document_type(self, text: str) -> DocumentType:
+        """Detectar tipo de documento basado en palabras clave"""
+        text_lower = text.lower()
+        
+        invoice_keywords = ['factura', 'invoice', 'proforma', 'albaran']
+        receipt_keywords = ['recibo', 'receipt', 'justificante', 'comprobante']
+        ticket_keywords = ['ticket', 'tique', 'nota', 'vale']
+        
+        if any(keyword in text_lower for keyword in invoice_keywords):
+            return DocumentType.INVOICE
+        elif any(keyword in text_lower for keyword in receipt_keywords):
+            return DocumentType.RECEIPT
+        elif any(keyword in text_lower for keyword in ticket_keywords):
+            return DocumentType.TICKET
+        else:
+            return DocumentType.UNKNOWN
+    
+    def preprocess_image(self, image: np.ndarray, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> np.ndarray:
+        """Preprocesar imagen según calidad solicitada"""
+        
         # Convertir a escala de grises
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         else:
             gray = image
-            
+        
+        if quality == ProcessingQuality.FAST:
+            # Procesamiento mínimo para velocidad
+            return gray
+        
         # Reducir ruido
-        denoised = cv2.medianBlur(gray, 3)
+        denoised = cv2.fastNlMeansDenoising(gray, h=10)
         
-        # Mejorar contraste usando CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(denoised)
+        if quality == ProcessingQuality.BALANCED:
+            # Mejorar contraste
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(denoised)
+            
+            # Binarización
+            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return binary
         
-        # Binarización adaptativa
-        binary = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        
-        return binary
+        elif quality == ProcessingQuality.HIGH:
+            # Procesamiento completo para máxima precisión
+            
+            # Detectar y corregir inclinación
+            coords = np.column_stack(np.where(denoised > 0))
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = 90 + angle
+            if angle != 0:
+                (h, w) = denoised.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(denoised, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            else:
+                rotated = denoised
+            
+            # Mejorar contraste adaptativo
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16,16))
+            enhanced = clahe.apply(rotated)
+            
+            # Morfología para mejorar texto
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+            morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+            
+            # Binarización adaptativa
+            binary = cv2.adaptiveThreshold(
+                morph, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
+            
+            return binary
     
-    def extract_text_from_image(self, image: Image.Image) -> str:
-        """Extraer texto de imagen usando Tesseract"""
+    def extract_text_from_image(self, image: Image.Image, quality: ProcessingQuality = ProcessingQuality.BALANCED, languages: str = None) -> Tuple[str, float]:
+        """Extraer texto con medición de confianza"""
+        
         # Convertir PIL a OpenCV
         opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         
         # Preprocesar
-        processed = self.preprocess_image(opencv_image)
+        processed = self.preprocess_image(opencv_image, quality)
         
-        # OCR con configuración optimizada para facturas
-        custom_config = f'--oem 3 --psm 6 -l {TESSERACT_LANGUAGES}'
-        text = pytesseract.image_to_string(processed, config=custom_config)
-        
-        return text.strip()
-    
-    def extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
-        """Extraer texto de PDF"""
-        try:
-            # Convertir PDF a imágenes
-            images = convert_from_bytes(pdf_bytes, first_page=1, last_page=MAX_PAGES_PDF)
-            
-            all_text = []
-            for i, image in enumerate(images):
-                text = self.extract_text_from_image(image)
-                all_text.append(f"--- Página {i+1} ---\n{text}")
-            
-            return "\n\n".join(all_text)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error procesando PDF: {str(e)}")
-    
-    def extract_data_from_text(self, text: str) -> Dict[str, Any]:
-        """Extraer datos estructurados del texto OCR"""
-        patterns = {
-            # Montos en diferentes formatos
-            'amount': r'(?:€\s*)?(\d+[.,]\d{2})(?:\s*€|\s*EUR)?',
-            # CIF/NIF español
-            'tax_id': r'(?:CIF|NIF|VAT)[:\s]*([A-Z]\d{7,8}[A-Z0-9])',
-            # Fechas DD/MM/YYYY o DD-MM-YYYY
-            'date': r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})',
-            # Número de factura/ticket
-            'invoice_number': r'(?:factura|invoice|ticket|n[°º])[:\s]*([A-Z0-9\-\/]+)',
-            # IVA
-            'vat': r'IVA[:\s]*(\d+[.,]\d{2})',
-            # Total
-            'total': r'(?:total|importe)[:\s]*(\d+[.,]\d{2})',
-            # Email
-            'email': r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
-            # Teléfono
-            'phone': r'(\+?[0-9\s\-\(\)]{9,15})',
+        # Configuración OCR según calidad
+        psm_modes = {
+            ProcessingQuality.FAST: 3,      # Automatic page segmentation
+            ProcessingQuality.BALANCED: 6,   # Uniform block of text
+            ProcessingQuality.HIGH: 11       # Sparse text
         }
         
-        extracted = {}
+        lang = languages or TESSERACT_LANGUAGES
+        custom_config = f'--oem 3 --psm {psm_modes[quality]} -l {lang}'
         
-        # Buscar cada patrón
-        for key, pattern in patterns.items():
-            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+        # OCR con datos de confianza
+        data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
+        
+        # Calcular confianza promedio
+        confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+        
+        # Extraer texto
+        text = pytesseract.image_to_string(processed, config=custom_config)
+        
+        return text.strip(), avg_confidence
+    
+    def extract_text_from_pdf(self, pdf_bytes: bytes, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> Tuple[str, float]:
+        """Extraer texto de PDF con procesamiento paralelo"""
+        try:
+            # Configurar DPI según calidad
+            dpi_settings = {
+                ProcessingQuality.FAST: 150,
+                ProcessingQuality.BALANCED: 200,
+                ProcessingQuality.HIGH: 300
+            }
             
-            if key == 'amount' or key == 'total' or key == 'vat':
-                # Para montos, tomar el más alto
-                if matches:
-                    amounts = [float(m.replace(',', '.')) for m in matches]
-                    extracted[key] = max(amounts)
-            elif key == 'date':
-                # Para fechas, formatear a ISO
-                if matches:
-                    day, month, year = matches[0]
-                    extracted[key] = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-            else:
-                # Para otros, tomar el primero
-                if matches:
-                    extracted[key] = matches[0] if isinstance(matches[0], str) else matches[0][0]
+            # Convertir PDF a imágenes
+            images = convert_from_bytes(
+                pdf_bytes, 
+                first_page=1, 
+                last_page=MAX_PAGES_PDF,
+                dpi=dpi_settings[quality]
+            )
+            
+            # Procesar páginas en paralelo
+            futures = []
+            for image in images:
+                future = executor.submit(self.extract_text_from_image, image, quality)
+                futures.append(future)
+            
+            # Recopilar resultados
+            all_text = []
+            total_confidence = 0
+            
+            for i, future in enumerate(futures):
+                text, confidence = future.result()
+                all_text.append(f"--- Página {i+1} ---\n{text}")
+                total_confidence += confidence
+            
+            avg_confidence = total_confidence / len(futures) if futures else 0
+            
+            return "\n\n".join(all_text), avg_confidence
+            
+        except Exception as e:
+            logger.error(f"Error procesando PDF: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Error procesando PDF: {str(e)}")
+    
+    def extract_structured_data(self, text: str, doc_type: DocumentType) -> Dict[str, Any]:
+        """Extracción avanzada de datos estructurados"""
         
-        # Intentar extraer nombre del proveedor (primera línea que parezca nombre)
-        lines = text.split('\n')
-        for line in lines[:5]:  # Solo primeras 5 líneas
-            line = line.strip()
-            if len(line) > 5 and len(line) < 50 and not any(char.isdigit() for char in line):
-                if not any(keyword in line.lower() for keyword in ['factura', 'ticket', 'fecha', 'cif', 'nif']):
-                    extracted['supplier_name'] = line
-                    break
+        patterns = self.document_patterns['spanish']
+        extracted = {
+            'document_type': doc_type.value,
+            'extraction_timestamp': datetime.now().isoformat(),
+            'financial': {},
+            'identification': {},
+            'dates': [],
+            'contacts': {},
+            'items': []
+        }
+        
+        # Extraer datos financieros
+        for key in ['amount', 'total', 'base_amount', 'vat_amount']:
+            matches = re.findall(patterns.get(key, ''), text, re.IGNORECASE | re.MULTILINE)
+            if matches:
+                amounts = []
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0]
+                    # Normalizar formato numérico
+                    normalized = match.replace('.', '').replace(',', '.')
+                    try:
+                        amounts.append(float(normalized))
+                    except ValueError:
+                        continue
+                
+                if amounts:
+                    if key == 'total':
+                        extracted['financial'][key] = max(amounts)
+                    else:
+                        extracted['financial'][key] = amounts[0] if len(amounts) == 1 else amounts
+        
+        # Extraer IVA
+        vat_rate_matches = re.findall(patterns['vat_rate'], text, re.IGNORECASE)
+        if vat_rate_matches:
+            extracted['financial']['vat_rate'] = int(vat_rate_matches[0])
+        
+        # Extraer identificación fiscal
+        tax_matches = re.findall(patterns['tax_id'], text, re.IGNORECASE)
+        if tax_matches:
+            extracted['identification']['tax_id'] = tax_matches[0]
+        
+        # Extraer número de factura
+        invoice_matches = re.findall(patterns['invoice_number'], text, re.IGNORECASE)
+        if invoice_matches:
+            extracted['identification']['invoice_number'] = invoice_matches[0]
+        
+        # Extraer IBAN
+        iban_matches = re.findall(patterns['iban'], text, re.IGNORECASE)
+        if iban_matches:
+            extracted['financial']['iban'] = iban_matches[0].replace(' ', '')
+        
+        # Extraer fechas
+        date_matches = re.findall(patterns['date'], text, re.IGNORECASE)
+        for date_match in date_matches[:3]:  # Máximo 3 fechas
+            day, month, year = date_match
+            if len(year) == 2:
+                year = '20' + year
+            try:
+                date_obj = datetime(int(year), int(month), int(day))
+                extracted['dates'].append(date_obj.strftime('%Y-%m-%d'))
+            except ValueError:
+                continue
+        
+        # Extraer contactos
+        email_pattern = r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+        phone_pattern = r'(\+?34)?[\s.-]?[6789]\d{2}[\s.-]?\d{3}[\s.-]?\d{3}'
+        
+        email_matches = re.findall(email_pattern, text)
+        if email_matches:
+            extracted['contacts']['email'] = email_matches[0]
+        
+        phone_matches = re.findall(phone_pattern, text)
+        if phone_matches:
+            extracted['contacts']['phone'] = re.sub(r'[\s.-]', '', phone_matches[0])
+        
+        # Extraer nombre del proveedor
+        extracted['identification']['supplier'] = self._extract_supplier_name(text)
+        
+        # Intentar extraer líneas de items (para facturas detalladas)
+        if doc_type == DocumentType.INVOICE:
+            extracted['items'] = self._extract_line_items(text)
+        
+        # Calcular score de calidad
+        extracted['quality_score'] = self._calculate_quality_score(extracted)
         
         return extracted
+    
+    def _extract_supplier_name(self, text: str) -> Optional[str]:
+        """Extraer nombre del proveedor usando heurísticas mejoradas"""
+        lines = text.split('\n')
+        
+        # Patrones a excluir
+        exclude_patterns = [
+            r'^factura', r'^invoice', r'^ticket', r'^fecha', r'^date',
+            r'^cif', r'^nif', r'^vat', r'^total', r'^iva', r'^\d+',
+            r'^€', r'^eur', r'^[a-z]{1,3}$'
+        ]
+        
+        for line in lines[:10]:  # Buscar en primeras 10 líneas
+            line = line.strip()
+            
+            # Validaciones
+            if len(line) < 3 or len(line) > 60:
+                continue
+            
+            # Excluir líneas con patrones no deseados
+            if any(re.match(pattern, line.lower()) for pattern in exclude_patterns):
+                continue
+            
+            # Debe contener al menos una letra mayúscula
+            if not any(c.isupper() for c in line):
+                continue
+            
+            # No debe ser solo números
+            if line.replace(' ', '').replace('-', '').replace('.', '').isdigit():
+                continue
+            
+            # Posible nombre de empresa
+            if re.match(r'^[A-Z][A-Za-z\s&,.\-]+', line):
+                return line
+        
+        return None
+    
+    def _extract_line_items(self, text: str) -> List[Dict]:
+        """Extraer items de línea de una factura"""
+        items = []
+        
+        # Patrón para líneas de items (descripción + cantidad + precio)
+        item_pattern = r'([A-Za-z\s]+)\s+(\d+)\s+(\d+[.,]\d{2})\s+(\d+[.,]\d{2})'
+        
+        matches = re.findall(item_pattern, text, re.MULTILINE)
+        
+        for match in matches:
+            description, quantity, unit_price, total = match
+            
+            try:
+                items.append({
+                    'description': description.strip(),
+                    'quantity': int(quantity),
+                    'unit_price': float(unit_price.replace(',', '.')),
+                    'total': float(total.replace(',', '.'))
+                })
+            except ValueError:
+                continue
+        
+        return items
+    
+    def _calculate_quality_score(self, extracted_data: Dict) -> float:
+        """Calcular puntuación de calidad de extracción"""
+        score = 0
+        max_score = 100
+        
+        # Puntuar según campos extraídos
+        scoring_rules = {
+            'financial': {
+                'total': 20,
+                'vat_amount': 10,
+                'base_amount': 10,
+                'vat_rate': 5
+            },
+            'identification': {
+                'tax_id': 15,
+                'invoice_number': 10,
+                'supplier': 10
+            },
+            'dates': 10,  # Al menos una fecha
+            'contacts': {
+                'email': 5,
+                'phone': 5
+            },
+            'items': 10  # Si tiene items detallados
+        }
+        
+        # Evaluar financial
+        for field, points in scoring_rules['financial'].items():
+            if field in extracted_data.get('financial', {}):
+                score += points
+        
+        # Evaluar identification
+        for field, points in scoring_rules['identification'].items():
+            if field in extracted_data.get('identification', {}):
+                score += points
+        
+        # Evaluar dates
+        if extracted_data.get('dates'):
+            score += scoring_rules['dates']
+        
+        # Evaluar contacts
+        for field, points in scoring_rules['contacts'].items():
+            if field in extracted_data.get('contacts', {}):
+                score += points
+        
+        # Evaluar items
+        if len(extracted_data.get('items', [])) > 0:
+            score += scoring_rules['items']
+        
+        return min(score / max_score * 100, 100)
 
-# Instancia del procesador
+class SimpleCache:
+    """Cache simple basado en archivos"""
+    
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = cache_dir
+    
+    def get_cache_key(self, content: bytes) -> str:
+        """Generar clave de caché basada en hash del contenido"""
+        return hashlib.sha256(content).hexdigest()
+    
+    def get(self, key: str) -> Optional[Dict]:
+        """Obtener del caché"""
+        cache_file = self.cache_dir / f"{key}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                    # Verificar que no esté expirado (24 horas)
+                    created = datetime.fromisoformat(data['created'])
+                    if (datetime.now() - created).days < 1:
+                        return data['result']
+            except Exception:
+                pass
+        return None
+    
+    def set(self, key: str, value: Dict):
+        """Guardar en caché"""
+        cache_file = self.cache_dir / f"{key}.json"
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump({
+                    'created': datetime.now().isoformat(),
+                    'result': value
+                }, f)
+        except Exception as e:
+            logger.error(f"Error guardando en caché: {e}")
+
+# Instancias globales
 ocr_processor = OCRProcessor()
+cache = SimpleCache(CACHE_DIR) if ENABLE_CACHE else None
+
+# Endpoints
 
 @app.get("/")
 async def root():
-    return {"message": "Cakely OCR Service", "status": "running"}
+    return {
+        "message": "Cakely OCR Service",
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": [
+            "/health",
+            "/ocr/process",
+            "/ocr/batch",
+            "/ocr/analyze",
+            "/docs"
+        ]
+    }
 
 @app.get("/health")
 async def health():
-    """Health check endpoint para verificar que el servicio está funcionando"""
+    """Health check con información detallada del sistema"""
     try:
-        # Verificar que Tesseract está disponible
-        import subprocess
-        result = subprocess.run([pytesseract.pytesseract.tesseract_cmd, '--version'], 
-                              capture_output=True, text=True, timeout=5)
+        # Verificar Tesseract
+        result = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, '--version'], 
+            capture_output=True, 
+            text=True, 
+            timeout=5
+        )
         tesseract_ok = result.returncode == 0
+        tesseract_version = result.stdout.split('\n')[0] if tesseract_ok else "N/A"
+        
+        # Verificar idiomas disponibles
+        langs_result = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, '--list-langs'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        available_languages = langs_result.stdout.strip().split('\n')[1:] if langs_result.returncode == 0 else []
         
         return {
             "status": "healthy",
-            "tesseract_available": tesseract_ok,
             "service": "OCR Service",
-            "version": "1.0.0"
+            "version": "2.0.0",
+            "tesseract": {
+                "available": tesseract_ok,
+                "version": tesseract_version,
+                "languages": available_languages
+            },
+            "cache": {
+                "enabled": ENABLE_CACHE,
+                "directory": str(CACHE_DIR) if ENABLE_CACHE else None
+            },
+            "limits": {
+                "max_file_size": MAX_FILE_SIZE,
+                "max_pdf_pages": MAX_PAGES_PDF
+            }
         }
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "service": "OCR Service"
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "error": str(e),
+                "service": "OCR Service"
+            }
+        )
 
 @app.post("/ocr/process")
-async def process_ocr(file: UploadFile = File(...)):
-    """Procesar archivo y extraer texto + datos estructurados"""
+async def process_ocr(
+    file: UploadFile = File(...),
+    quality: ProcessingQuality = Query(ProcessingQuality.BALANCED, description="Calidad de procesamiento"),
+    extract_items: bool = Query(False, description="Extraer items de línea"),
+    use_cache: bool = Query(True, description="Usar caché si está disponible")
+):
+    """
+    Procesar archivo y extraer texto con datos estructurados.
     
+    - **quality**: fast, balanced, or high (trade-off entre velocidad y precisión)
+    - **extract_items**: intentar extraer items individuales de facturas
+    - **use_cache**: usar resultados cacheados si están disponibles
+    """
+    
+    # Validar tipo de archivo
     if not file.content_type:
         raise HTTPException(status_code=400, detail="Tipo de archivo no especificado")
+    
+    allowed_types = ['image/jpeg', 'image/png', 'image/tiff', 'image/bmp', 'application/pdf']
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipo de archivo no soportado: {file.content_type}. Tipos permitidos: {allowed_types}"
+        )
     
     # Leer archivo
     try:
         content = await file.read()
+        
+        # Validar tamaño
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Archivo demasiado grande. Máximo: {MAX_FILE_SIZE / 1024 / 1024:.1f}MB"
+            )
+        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error leyendo archivo: {str(e)}")
     
+    # Verificar caché
+    cache_key = None
+    if cache and use_cache and ENABLE_CACHE:
+        cache_key = cache.get_cache_key(content)
+        cached_result = cache.get(cache_key)
+        if cached_result:
+            logger.info(f"Resultado obtenido de caché para {file.filename}")
+            cached_result['from_cache'] = True
+            return cached_result
+    
     # Procesar según tipo de archivo
+    start_time = datetime.now()
+    
     try:
         if file.content_type.startswith('image/'):
             # Procesar imagen
@@ -197,33 +618,424 @@ async def process_ocr(file: UploadFile = File(...)):
             if image.mode != 'RGB':
                 image = image.convert('RGB')
             
-            text = ocr_processor.extract_text_from_image(image)
+            text, confidence = ocr_processor.extract_text_from_image(image, quality)
             
         elif file.content_type == 'application/pdf':
             # Procesar PDF
-            text = ocr_processor.extract_text_from_pdf(content)
-            
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Tipo de archivo no soportado: {file.content_type}"
-            )
+            text, confidence = ocr_processor.extract_text_from_pdf(content, quality)
+        
+        # Detectar tipo de documento
+        doc_type = ocr_processor.detect_document_type(text)
         
         # Extraer datos estructurados
-        extracted_data = ocr_processor.extract_data_from_text(text)
+        extracted_data = ocr_processor.extract_structured_data(text, doc_type)
         
-        return {
+        # Calcular tiempo de procesamiento
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        result = {
             "success": True,
             "filename": file.filename,
             "content_type": file.content_type,
+            "document_type": doc_type.value,
             "raw_text": text,
             "extracted_data": extracted_data,
-            "confidence": "high" if len(text) > 50 else "low"
+            "metrics": {
+                "confidence": round(confidence, 2),
+                "quality_score": round(extracted_data['quality_score'], 2),
+                "processing_time": round(processing_time, 3),
+                "text_length": len(text),
+                "quality_setting": quality.value
+            },
+            "from_cache": False
+        }
+        
+        # Guardar en caché
+        if cache and use_cache and ENABLE_CACHE and cache_key:
+            cache.set(cache_key, result)
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error procesando OCR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando OCR: {str(e)}")
+
+@app.post("/ocr/batch")
+async def process_batch(
+    files: List[UploadFile] = File(...),
+    quality: ProcessingQuality = Query(ProcessingQuality.BALANCED),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Procesar múltiples archivos en lote.
+    Limitado a 10 archivos por petición.
+    """
+    
+    if len(files) > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Máximo 10 archivos por lote"
+        )
+    
+    results = []
+    errors = []
+    
+    for file in files:
+        try:
+            # Procesar cada archivo
+            content = await file.read()
+            
+            if file.content_type.startswith('image/'):
+                image = Image.open(io.BytesIO(content))
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                text, confidence = ocr_processor.extract_text_from_image(image, quality)
+            elif file.content_type == 'application/pdf':
+                text, confidence = ocr_processor.extract_text_from_pdf(content, quality)
+            else:
+                errors.append({
+                    "filename": file.filename,
+                    "error": f"Tipo no soportado: {file.content_type}"
+                })
+                continue
+            
+            doc_type = ocr_processor.detect_document_type(text)
+            extracted_data = ocr_processor.extract_structured_data(text, doc_type)
+            
+            results.append({
+                "filename": file.filename,
+                "document_type": doc_type.value,
+                "extracted_data": extracted_data,
+                "confidence": round(confidence, 2)
+            })
+            
+        except Exception as e:
+            errors.append({
+                "filename": file.filename,
+                "error": str(e)
+            })
+    
+    return {
+        "success": len(errors) == 0,
+        "processed": len(results),
+        "failed": len(errors),
+        "results": results,
+        "errors": errors if errors else None
+    }
+
+@app.post("/ocr/analyze")
+async def analyze_document(file: UploadFile = File(...)):
+    """
+    Analizar documento sin extraer texto completo.
+    Útil para obtener metadatos y vista previa rápida.
+    """
+    
+    try:
+        content = await file.read()
+        
+        analysis = {
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size_bytes": len(content),
+            "size_mb": round(len(content) / 1024 / 1024, 2)
+        }
+        
+        if file.content_type.startswith('image/'):
+            # Analizar imagen
+            image = Image.open(io.BytesIO(content))
+            
+            analysis.update({
+                "type": "image",
+                "dimensions": {
+                    "width": image.width,
+                    "height": image.height
+                },
+                "format": image.format,
+                "mode": image.mode,
+                "dpi": image.info.get('dpi', (72, 72)),
+                "has_transparency": image.mode in ('RGBA', 'LA', 'P'),
+                "estimated_quality": _estimate_image_quality(image)
+            })
+            
+            # Vista previa rápida del texto (solo primera parte)
+            text, confidence = ocr_processor.extract_text_from_image(
+                image.crop((0, 0, image.width, min(500, image.height))),
+                ProcessingQuality.FAST
+            )
+            
+            analysis["preview"] = {
+                "text": text[:500] + "..." if len(text) > 500 else text,
+                "confidence": round(confidence, 2)
+            }
+            
+        elif file.content_type == 'application/pdf':
+            # Analizar PDF
+            import PyPDF2
+            from io import BytesIO
+            
+            pdf_reader = PyPDF2.PdfReader(BytesIO(content))
+            
+            analysis.update({
+                "type": "pdf",
+                "num_pages": len(pdf_reader.pages),
+                "is_encrypted": pdf_reader.is_encrypted,
+                "metadata": {
+                    "title": pdf_reader.metadata.get('/Title', ''),
+                    "author": pdf_reader.metadata.get('/Author', ''),
+                    "subject": pdf_reader.metadata.get('/Subject', ''),
+                    "creator": pdf_reader.metadata.get('/Creator', ''),
+                } if pdf_reader.metadata else {}
+            })
+            
+            # Intentar extraer texto nativo del PDF
+            first_page_text = ""
+            try:
+                first_page_text = pdf_reader.pages[0].extract_text()[:500]
+            except:
+                pass
+            
+            analysis["has_text_layer"] = bool(first_page_text.strip())
+            
+            if first_page_text:
+                analysis["preview"] = {
+                    "text": first_page_text,
+                    "source": "native_pdf"
+                }
+        
+        # Detectar tipo de documento probable
+        if "preview" in analysis and analysis["preview"]["text"]:
+            doc_type = ocr_processor.detect_document_type(analysis["preview"]["text"])
+            analysis["probable_document_type"] = doc_type.value
+        
+        return analysis
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analizando documento: {str(e)}")
+
+def _estimate_image_quality(image: Image.Image) -> str:
+    """Estimar calidad de imagen para OCR"""
+    
+    # Factores de calidad
+    width, height = image.size
+    resolution = width * height
+    
+    if resolution < 500000:  # < 0.5 MP
+        return "low"
+    elif resolution < 2000000:  # < 2 MP
+        return "medium"
+    else:
+        return "high"
+
+@app.get("/ocr/supported-languages")
+async def get_supported_languages():
+    """Obtener idiomas soportados para OCR"""
+    
+    try:
+        result = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, '--list-langs'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            languages = result.stdout.strip().split('\n')[1:]  # Skip header
+            
+            # Mapear códigos a nombres completos
+            language_names = {
+                'spa': 'Español',
+                'eng': 'English',
+                'fra': 'Français',
+                'deu': 'Deutsch',
+                'ita': 'Italiano',
+                'por': 'Português',
+                'cat': 'Català',
+                'eus': 'Euskera',
+                'glg': 'Galego'
+            }
+            
+            supported = []
+            for lang in languages:
+                supported.append({
+                    'code': lang,
+                    'name': language_names.get(lang, lang),
+                    'available': True
+                })
+            
+            return {
+                "default": TESSERACT_LANGUAGES,
+                "supported": supported,
+                "total": len(supported)
+            }
+        else:
+            raise Exception("No se pudo obtener la lista de idiomas")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/ocr/cache")
+async def clear_cache():
+    """Limpiar caché de OCR"""
+    
+    if not ENABLE_CACHE:
+        return {"message": "Caché deshabilitado"}
+    
+    try:
+        import shutil
+        
+        # Contar archivos antes de limpiar
+        files_count = len(list(CACHE_DIR.glob("*.json")))
+        
+        # Limpiar directorio
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR)
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        return {
+            "success": True,
+            "message": "Caché limpiado",
+            "files_removed": files_count
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando OCR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error limpiando caché: {str(e)}")
+
+@app.post("/ocr/validate")
+async def validate_document(file: UploadFile = File(...)):
+    """
+    Validar si un documento cumple con requisitos mínimos para facturación.
+    """
+    
+    try:
+        # Procesar documento
+        content = await file.read()
+        
+        if file.content_type.startswith('image/'):
+            image = Image.open(io.BytesIO(content))
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            text, confidence = ocr_processor.extract_text_from_image(image, ProcessingQuality.HIGH)
+        elif file.content_type == 'application/pdf':
+            text, confidence = ocr_processor.extract_text_from_pdf(content, ProcessingQuality.HIGH)
+        else:
+            raise HTTPException(status_code=400, detail="Tipo de archivo no soportado")
+        
+        # Detectar tipo y extraer datos
+        doc_type = ocr_processor.detect_document_type(text)
+        extracted = ocr_processor.extract_structured_data(text, doc_type)
+        
+        # Validaciones requeridas para factura española
+        validations = {
+            "has_tax_id": bool(extracted.get('identification', {}).get('tax_id')),
+            "has_invoice_number": bool(extracted.get('identification', {}).get('invoice_number')),
+            "has_date": bool(extracted.get('dates')),
+            "has_total": bool(extracted.get('financial', {}).get('total')),
+            "has_supplier": bool(extracted.get('identification', {}).get('supplier')),
+            "has_vat_info": bool(extracted.get('financial', {}).get('vat_rate') or 
+                                 extracted.get('financial', {}).get('vat_amount')),
+        }
+        
+        # Campos recomendados
+        recommendations = {
+            "has_base_amount": bool(extracted.get('financial', {}).get('base_amount')),
+            "has_payment_method": bool(extracted.get('financial', {}).get('payment_method')),
+            "has_iban": bool(extracted.get('financial', {}).get('iban')),
+            "has_email": bool(extracted.get('contacts', {}).get('email')),
+            "has_items": bool(extracted.get('items')),
+        }
+        
+        # Calcular validez
+        required_fields = sum(validations.values())
+        total_required = len(validations)
+        is_valid = required_fields >= (total_required - 1)  # Permitir 1 campo faltante
+        
+        # Calcular completitud
+        optional_fields = sum(recommendations.values())
+        completeness = (required_fields + optional_fields) / (len(validations) + len(recommendations)) * 100
+        
+        return {
+            "valid": is_valid,
+            "document_type": doc_type.value,
+            "completeness_percentage": round(completeness, 1),
+            "validation_results": validations,
+            "recommendations": recommendations,
+            "missing_required": [k for k, v in validations.items() if not v],
+            "missing_optional": [k for k, v in recommendations.items() if not v],
+            "quality_metrics": {
+                "ocr_confidence": round(confidence, 2),
+                "extraction_quality": round(extracted['quality_score'], 2)
+            },
+            "extracted_summary": {
+                "supplier": extracted.get('identification', {}).get('supplier'),
+                "invoice_number": extracted.get('identification', {}).get('invoice_number'),
+                "date": extracted.get('dates', [None])[0] if extracted.get('dates') else None,
+                "total": extracted.get('financial', {}).get('total'),
+                "tax_id": extracted.get('identification', {}).get('tax_id')
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error validando documento: {str(e)}")
+
+# Middleware para logging
+@app.middleware("http")
+async def log_requests(request, call_next):
+    start_time = datetime.now()
+    
+    # Procesar request
+    response = await call_next(request)
+    
+    # Log de la petición
+    process_time = (datetime.now() - start_time).total_seconds()
+    logger.info(
+        f"{request.method} {request.url.path} - "
+        f"Status: {response.status_code} - "
+        f"Time: {process_time:.3f}s"
+    )
+    
+    return response
+
+# Manejadores de errores
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "path": str(request.url)
+        }
+    )
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request, exc):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": str(exc),
+            "type": "validation_error"
+        }
+    )
+
+# Cleanup al cerrar
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Limpiar recursos al cerrar la aplicación"""
+    executor.shutdown(wait=True)
+    logger.info("OCR Service shutdown complete")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    
+    # Configuración de desarrollo
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8001,
+        reload=True,
+        log_level="info"
+    )
