@@ -368,45 +368,112 @@ class OCRProcessor:
         return cleaned.strip()
     
     def extract_text_from_pdf(self, pdf_bytes: bytes, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> Tuple[str, float]:
-        """Extraer texto de PDF con procesamiento paralelo"""
+        """Extraer texto de PDF con procesamiento mejorado"""
         try:
-            # Configurar DPI según calidad
+            # Primero intentar extraer texto nativo del PDF
+            native_text = self._extract_native_pdf_text(pdf_bytes)
+            if native_text and len(native_text.strip()) > 50:
+                logger.info("Usando texto nativo del PDF")
+                return native_text, 95.0  # Alta confianza para texto nativo
+            
+            logger.info("PDF sin texto nativo, usando OCR")
+            
+            # Configurar DPI según calidad (aumentado para mejor OCR)
             dpi_settings = {
-                ProcessingQuality.FAST: 150,
-                ProcessingQuality.BALANCED: 200,
+                ProcessingQuality.FAST: 200,
+                ProcessingQuality.BALANCED: 250,
                 ProcessingQuality.HIGH: 300
             }
             
-            # Convertir PDF a imágenes
+            # Convertir PDF a imágenes con configuración mejorada
             images = convert_from_bytes(
                 pdf_bytes, 
                 first_page=1, 
                 last_page=MAX_PAGES_PDF,
-                dpi=dpi_settings[quality]
+                dpi=dpi_settings[quality],
+                fmt='PNG',  # PNG para mejor calidad
+                thread_count=2,  # Usar múltiples threads
+                poppler_path=None  # Usar poppler del sistema
             )
             
-            # Procesar páginas en paralelo
-            futures = []
-            for image in images:
-                future = executor.submit(self.extract_text_from_image, image, quality)
-                futures.append(future)
+            if not images:
+                raise Exception("No se pudieron convertir las páginas del PDF")
             
-            # Recopilar resultados
+            logger.info(f"Convertidas {len(images)} páginas del PDF a imágenes")
+            
+            # Procesar páginas
             all_text = []
             total_confidence = 0
+            successful_pages = 0
             
-            for i, future in enumerate(futures):
-                text, confidence = future.result()
-                all_text.append(f"--- Página {i+1} ---\n{text}")
-                total_confidence += confidence
+            for i, image in enumerate(images):
+                try:
+                    # Verificar que la imagen se convirtió correctamente
+                    if image.size[0] < 100 or image.size[1] < 100:
+                        logger.warning(f"Página {i+1}: imagen muy pequeña {image.size}")
+                        continue
+                    
+                    # Procesar OCR
+                    text, confidence = self.extract_text_from_image(image, quality)
+                    
+                    if text and len(text.strip()) > 5:  # Solo incluir si hay texto válido
+                        all_text.append(f"--- Página {i+1} ---\n{text}")
+                        total_confidence += confidence
+                        successful_pages += 1
+                        logger.info(f"Página {i+1}: {len(text)} caracteres, confianza {confidence:.1f}%")
+                    else:
+                        logger.warning(f"Página {i+1}: sin texto extraído")
+                        all_text.append(f"--- Página {i+1} ---\n[Sin texto detectado]")
+                        
+                except Exception as page_error:
+                    logger.error(f"Error procesando página {i+1}: {page_error}")
+                    all_text.append(f"--- Página {i+1} ---\n[Error procesando página]")
             
-            avg_confidence = total_confidence / len(futures) if futures else 0
+            # Calcular confianza promedio
+            avg_confidence = total_confidence / successful_pages if successful_pages > 0 else 0
             
-            return "\n\n".join(all_text), avg_confidence
+            final_text = "\n\n".join(all_text)
+            
+            if not final_text.strip() or successful_pages == 0:
+                logger.error("No se pudo extraer texto de ninguna página")
+                return "[No se pudo extraer texto del PDF]", 0.0
+            
+            logger.info(f"Procesamiento completado: {successful_pages}/{len(images)} páginas exitosas")
+            return final_text, avg_confidence
             
         except Exception as e:
             logger.error(f"Error procesando PDF: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Error procesando PDF: {str(e)}")
+    
+    def _extract_native_pdf_text(self, pdf_bytes: bytes) -> str:
+        """Intentar extraer texto nativo del PDF"""
+        try:
+            import PyPDF2
+            from io import BytesIO
+            
+            pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+            
+            if pdf_reader.is_encrypted:
+                return ""
+            
+            text_parts = []
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        text_parts.append(f"--- Página {page_num + 1} ---\n{page_text}")
+                except Exception as e:
+                    logger.warning(f"Error extrayendo texto nativo de página {page_num + 1}: {e}")
+                    continue
+            
+            return "\n\n".join(text_parts) if text_parts else ""
+            
+        except ImportError:
+            logger.warning("PyPDF2 no disponible, usando solo OCR")
+            return ""
+        except Exception as e:
+            logger.warning(f"Error extrayendo texto nativo: {e}")
+            return ""
     
     def extract_structured_data(self, text: str, doc_type: DocumentType) -> Dict[str, Any]:
         """Extracción avanzada de datos estructurados"""
@@ -1398,6 +1465,94 @@ async def validate_document(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error validando documento: {str(e)}")
+
+@app.post("/ocr/debug-pdf")
+async def debug_pdf(file: UploadFile = File(...)):
+    """
+    Debug específico para PDFs - analiza el contenido y la conversión a imágenes
+    """
+    
+    if not file.content_type or file.content_type != 'application/pdf':
+        raise HTTPException(status_code=400, detail="Solo se admiten archivos PDF")
+    
+    try:
+        content = await file.read()
+        
+        # Información básica del PDF
+        pdf_info = {
+            "size_bytes": len(content),
+            "size_mb": round(len(content) / 1024 / 1024, 2)
+        }
+        
+        # Intentar extraer texto nativo
+        native_text = ocr_processor._extract_native_pdf_text(content)
+        has_native_text = bool(native_text and len(native_text.strip()) > 10)
+        
+        pdf_info["has_native_text"] = has_native_text
+        pdf_info["native_text_length"] = len(native_text) if native_text else 0
+        pdf_info["native_text_preview"] = native_text[:200] + "..." if native_text and len(native_text) > 200 else native_text
+        
+        # Intentar conversión a imágenes
+        conversion_results = {}
+        
+        for dpi in [150, 200, 300]:
+            try:
+                images = convert_from_bytes(
+                    content,
+                    first_page=1,
+                    last_page=2,  # Solo primeras 2 páginas para debug
+                    dpi=dpi,
+                    fmt='PNG'
+                )
+                
+                conversion_results[f"dpi_{dpi}"] = {
+                    "success": True,
+                    "pages_converted": len(images),
+                    "image_sizes": [img.size for img in images[:2]] if images else []
+                }
+                
+                # OCR rápido en primera página si existe
+                if images:
+                    first_page_text, confidence = ocr_processor.extract_text_from_image(
+                        images[0], 
+                        ProcessingQuality.FAST
+                    )
+                    conversion_results[f"dpi_{dpi}"]["ocr_preview"] = {
+                        "text": first_page_text[:200] + "..." if len(first_page_text) > 200 else first_page_text,
+                        "confidence": confidence,
+                        "text_length": len(first_page_text)
+                    }
+                
+            except Exception as e:
+                conversion_results[f"dpi_{dpi}"] = {
+                    "success": False,
+                    "error": str(e)
+                }
+        
+        # Recomendaciones
+        recommendations = []
+        
+        if has_native_text:
+            recommendations.append("✅ PDF tiene texto nativo - OCR no necesario")
+        else:
+            recommendations.append("⚠️ PDF es imagen escaneada - requiere OCR")
+        
+        if not any(result.get("success", False) for result in conversion_results.values()):
+            recommendations.append("❌ Error convirtiendo PDF a imágenes")
+        elif all(result.get("ocr_preview", {}).get("confidence", 0) < 50 
+                for result in conversion_results.values() if result.get("success")):
+            recommendations.append("⚠️ Baja confianza OCR - verificar calidad del escaneo")
+        
+        return {
+            "filename": file.filename,
+            "pdf_info": pdf_info,
+            "conversion_results": conversion_results,
+            "recommendations": recommendations,
+            "best_approach": "native_text" if has_native_text else "ocr_high_dpi"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en debug PDF: {str(e)}")
 
 @app.post("/ocr/debug")
 async def debug_ocr(

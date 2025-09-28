@@ -9,3 +9,4 @@ opencv-python==4.8.1.78
 numpy==1.25.2
 pydantic==2.5.0
 python-dotenv==1.0.0
+PyPDF2==3.0.1
