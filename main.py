@@ -193,12 +193,9 @@ class OCRProcessor:
             gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
             
         if quality == ProcessingQuality.FAST:
-            # Procesamiento básico pero efectivo
-            # Mejorar contraste simple
-            enhanced = cv2.equalizeHist(gray)
-            # Binarización básica
-            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            return binary
+            # Procesamiento mínimo - solo escala de grises
+            logger.info("Procesamiento FAST - solo escala de grises")
+            return gray
         
         # Reducir ruido con parámetros ajustados
         denoised = cv2.fastNlMeansDenoising(gray, h=8, templateWindowSize=7, searchWindowSize=21)
@@ -275,63 +272,97 @@ class OCRProcessor:
     def extract_text_from_image(self, image: Image.Image, quality: ProcessingQuality = ProcessingQuality.BALANCED, languages: str = None) -> Tuple[str, float]:
         """Extraer texto con medición de confianza mejorada"""
         
-        # Convertir PIL a OpenCV
-        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        
-        # Preprocesar con mejoras
-        processed = self.preprocess_image(opencv_image, quality)
-        
-        # Configuración OCR mejorada según calidad
-        psm_modes = {
-            ProcessingQuality.FAST: 6,       # Uniform block of text
-            ProcessingQuality.BALANCED: 3,   # Automatic page segmentation
-            ProcessingQuality.HIGH: 1        # Automatic page segmentation with OSD
-        }
-        
-        lang = languages or TESSERACT_LANGUAGES
-        
-        # Configuración más robusta
-        base_config = f'--oem 3 --psm {psm_modes[quality]} -l {lang}'
-        
-        # Parámetros adicionales para mejorar la detección
-        if quality == ProcessingQuality.HIGH:
-            # Configuración más agresiva para alta calidad
-            whitelist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ€.,;:!?()[]{}'\\-+*/=@#$%&|<>^_`~ "
-            custom_config = f'{base_config} -c tessedit_char_whitelist={whitelist}'
-        else:
-            custom_config = base_config
+        logger.info(f"Iniciando OCR - Imagen: {image.size}, Modo: {image.mode}, Calidad: {quality}")
         
         try:
-            # Intentar OCR múltiple con diferentes configuraciones si es necesario
-            text = pytesseract.image_to_string(processed, config=custom_config)
+            # Verificar que Tesseract esté disponible
+            result = subprocess.run([pytesseract.pytesseract.tesseract_cmd, '--version'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                logger.error("Tesseract no está disponible")
+                return "Error: Tesseract no disponible", 0.0
             
-            # Si el texto es muy corto o contiene muchos caracteres raros, intentar con otra configuración
-            if len(text.strip()) < 10 or self._has_too_many_invalid_chars(text):
-                # Intentar con modo PSM diferente
-                fallback_psm = 6 if psm_modes[quality] != 6 else 3
-                fallback_config = f'--oem 3 --psm {fallback_psm} -l {lang}'
-                fallback_text = pytesseract.image_to_string(processed, config=fallback_config)
-                
-                # Usar el texto más largo y con menos caracteres inválidos
-                if len(fallback_text.strip()) > len(text.strip()) and not self._has_too_many_invalid_chars(fallback_text):
-                    text = fallback_text
-                    custom_config = fallback_config
+            # Convertir PIL a OpenCV
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
             
-            # OCR con datos de confianza usando la configuración final
-            data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
+            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            logger.info(f"Imagen convertida a OpenCV: {opencv_image.shape}")
             
-            # Calcular confianza promedio (solo palabras con confianza > 30)
-            confidences = [int(conf) for conf in data['conf'] if int(conf) > 30]
-            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            # Verificar que OpenCV funciona
+            if opencv_image is None or opencv_image.size == 0:
+                logger.error("Error convirtiendo imagen a OpenCV")
+                return "Error: conversión de imagen falló", 0.0
             
-            # Limpiar texto de caracteres extraños
-            cleaned_text = self._clean_extracted_text(text)
+            # Preprocesar con mejoras
+            processed = self.preprocess_image(opencv_image, quality)
+            logger.info(f"Imagen procesada: {processed.shape if processed is not None else 'None'}")
             
-            return cleaned_text.strip(), avg_confidence
+            if processed is None:
+                logger.error("Preprocesamiento devolvió None")
+                return "Error: preprocesamiento falló", 0.0
+            
+            # Configuración OCR más simple y robusta
+            lang = languages or TESSERACT_LANGUAGES
+            logger.info(f"Usando idiomas: {lang}")
+            
+            # Probar diferentes configuraciones PSM en orden de simplicidad
+            psm_configs = [
+                ('PSM 6', f'--oem 3 --psm 6 -l {lang}'),      # Uniform block of text
+                ('PSM 3', f'--oem 3 --psm 3 -l {lang}'),      # Auto page segmentation  
+                ('PSM 8', f'--oem 3 --psm 8 -l {lang}'),      # Single word
+                ('PSM 7', f'--oem 3 --psm 7 -l {lang}'),      # Single text line
+            ]
+            
+            best_text = ""
+            best_confidence = 0.0
+            best_config_name = ""
+            
+            for config_name, config in psm_configs:
+                try:
+                    logger.info(f"Probando configuración: {config_name}")
+                    
+                    # Extraer texto
+                    text = pytesseract.image_to_string(processed, config=config)
+                    logger.info(f"{config_name} - Texto extraído: {len(text)} caracteres")
+                    
+                    if len(text.strip()) > len(best_text.strip()):
+                        # Calcular confianza
+                        try:
+                            data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
+                            confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+                            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+                        except:
+                            avg_confidence = 50.0  # Confianza por defecto
+                        
+                        if len(text.strip()) > 0:  # Si hay texto, es mejor que nada
+                            best_text = text
+                            best_confidence = avg_confidence
+                            best_config_name = config_name
+                            logger.info(f"Nueva mejor configuración: {config_name} - Confianza: {avg_confidence}")
+                        
+                        # Si ya tenemos buen texto, no necesitamos probar más
+                        if len(text.strip()) > 50 and avg_confidence > 70:
+                            break
+                            
+                except Exception as config_error:
+                    logger.warning(f"Error con {config_name}: {config_error}")
+                    continue
+            
+            # Limpiar texto final
+            if best_text:
+                cleaned_text = self._clean_extracted_text(best_text)
+                logger.info(f"OCR completado - Config: {best_config_name}, Texto: {len(cleaned_text)} chars, Confianza: {best_confidence}")
+                return cleaned_text.strip(), best_confidence
+            else:
+                logger.warning("No se pudo extraer texto con ninguna configuración")
+                return "", 0.0
             
         except Exception as e:
-            logger.error(f"Error en extracción OCR: {e}")
-            return "", 0.0
+            logger.error(f"Error crítico en extracción OCR: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return f"Error: {str(e)}", 0.0
     
     def _has_too_many_invalid_chars(self, text: str) -> bool:
         """Verificar si el texto tiene demasiados caracteres inválidos"""
@@ -1465,6 +1496,74 @@ async def validate_document(file: UploadFile = File(...)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error validando documento: {str(e)}")
+
+@app.get("/ocr/test-tesseract")
+async def test_tesseract():
+    """
+    Endpoint simple para verificar que Tesseract funciona correctamente
+    """
+    try:
+        # Verificar versión de Tesseract
+        result = subprocess.run([pytesseract.pytesseract.tesseract_cmd, '--version'], 
+                              capture_output=True, text=True, timeout=10)
+        
+        if result.returncode != 0:
+            return {
+                "tesseract_working": False,
+                "error": "Tesseract no responde",
+                "stderr": result.stderr
+            }
+        
+        # Verificar idiomas disponibles
+        langs_result = subprocess.run([pytesseract.pytesseract.tesseract_cmd, '--list-langs'],
+                                    capture_output=True, text=True, timeout=10)
+        
+        available_langs = []
+        if langs_result.returncode == 0:
+            available_langs = langs_result.stdout.strip().split('\n')[1:]  # Skip header
+        
+        # Crear imagen de prueba simple
+        from PIL import Image, ImageDraw, ImageFont
+        test_image = Image.new('RGB', (300, 100), color='white')
+        draw = ImageDraw.Draw(test_image)
+        
+        # Texto de prueba
+        test_text = "Hello World 123"
+        try:
+            # Intentar usar fuente por defecto
+            draw.text((10, 30), test_text, fill='black')
+        except:
+            # Si falla, usar fuente básica
+            draw.text((10, 30), test_text, fill='black')
+        
+        # Probar OCR en imagen de prueba
+        try:
+            ocr_result = pytesseract.image_to_string(test_image, config='--psm 8 -l eng')
+            ocr_working = len(ocr_result.strip()) > 0
+            extracted_text = ocr_result.strip()
+        except Exception as ocr_error:
+            ocr_working = False
+            extracted_text = f"Error: {str(ocr_error)}"
+        
+        return {
+            "tesseract_working": True,
+            "version": result.stdout.split('\n')[0] if result.stdout else "Unknown",
+            "available_languages": available_langs,
+            "configured_languages": TESSERACT_LANGUAGES,
+            "ocr_test": {
+                "working": ocr_working,
+                "test_text": test_text,
+                "extracted_text": extracted_text,
+                "match": test_text.lower() in extracted_text.lower()
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "tesseract_working": False,
+            "error": str(e),
+            "traceback": str(e)
+        }
 
 @app.post("/ocr/debug-pdf")
 async def debug_pdf(file: UploadFile = File(...)):
