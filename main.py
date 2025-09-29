@@ -1716,24 +1716,50 @@ async def enhance_and_process(
         opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
         
-        # Diferentes técnicas de mejoramiento
-        enhancement_methods = {
-            'original': gray,
-            'histogram_equalization': cv2.equalizeHist(gray),
-            'clahe': cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(gray),
-            'bilateral_filter': cv2.bilateralFilter(gray, 9, 75, 75),
-            'gaussian_blur': cv2.GaussianBlur(gray, (3, 3), 0),
-            'median_filter': cv2.medianFilter(gray, 3),
-        }
+        # Diferentes técnicas de mejoramiento con manejo de errores
+        enhancement_methods = {}
+        
+        # Método original (siempre funciona)
+        enhancement_methods['original'] = gray
+        
+        # Probar cada método con manejo de errores individual
+        try:
+            enhancement_methods['histogram_equalization'] = cv2.equalizeHist(gray)
+        except Exception:
+            pass
+            
+        try:
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            enhancement_methods['clahe'] = clahe.apply(gray)
+        except Exception:
+            pass
+            
+        try:
+            enhancement_methods['bilateral_filter'] = cv2.bilateralFilter(gray, 9, 75, 75)
+        except Exception:
+            pass
+            
+        try:
+            enhancement_methods['gaussian_blur'] = cv2.GaussianBlur(gray, (3, 3), 0)
+        except Exception:
+            pass
+            
+        try:
+            enhancement_methods['median_blur'] = cv2.medianBlur(gray, 3)
+        except Exception:
+            pass
         
         # Si la imagen es pequeña, redimensionar
-        if image.size[0] < 600 or image.size[1] < 600:
-            scale = max(800/image.size[0], 800/image.size[1])
-            new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
-            resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
-            opencv_resized = cv2.cvtColor(np.array(resized_image), cv2.COLOR_RGB2BGR)
-            gray_resized = cv2.cvtColor(opencv_resized, cv2.COLOR_BGR2GRAY)
-            enhancement_methods['upscaled'] = gray_resized
+        try:
+            if image.size[0] < 600 or image.size[1] < 600:
+                scale = max(800/image.size[0], 800/image.size[1])
+                new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
+                resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+                opencv_resized = cv2.cvtColor(np.array(resized_image), cv2.COLOR_RGB2BGR)
+                gray_resized = cv2.cvtColor(opencv_resized, cv2.COLOR_BGR2GRAY)
+                enhancement_methods['upscaled'] = gray_resized
+        except Exception:
+            pass  # Si falla el redimensionado, continuar sin él
         
         results = {}
         best_result = None
