@@ -123,13 +123,13 @@ class OCRProcessor:
                 'amount': r'(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?:\s*€|\s*EUR)?',
                 'tax_id': r'(?:CIF|NIF|VAT|DNI)[:\s]*([A-Z]\d{7,8}[A-Z0-9]|\d{8}[A-Z])',
                 'date': r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})',
-                'invoice_number': r'(?:factura|n[°ºo]|número|num\.?)[:\s]*([A-Z0-9\-\/]+)',
+                'invoice_number': r'(?:factura|n[°ºo]|número|num\.?|ticket)[:\s]*([A-Z0-9\-\/]+)',
                 'vat_rate': r'IVA[:\s]*(\d{1,2})[%\s]',
-                'vat_amount': r'IVA[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
+                'vat_amount': r'(?:IVA|CUOTA)[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
                 'base_amount': r'(?:base\s*imponible|subtotal)[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
-                'total': r'(?:total|importe\s*total|total\s*factura)[:\s]*(?:€\s*)?(\d+[.,]\d{2})',
+                'total': r'(?:^|\n)\s*(?:TOTAL|total)\s*(?:€\s*)?(\d+[.,]\d{2})(?:\s*€)?(?:\s*$|\n)',
                 'iban': r'(?:IBAN|iban)[:\s]*([A-Z]{2}\d{2}[\s]?(?:\d{4}[\s]?){5})',
-                'payment_method': r'(?:forma\s*de\s*pago|método\s*pago)[:\s]*([A-Za-z\s]+)',
+                'payment_method': r'(?:forma\s*de\s*pago|método\s*pago|tarjeta)[:\s]*([A-Za-z\s]+)',
             },
             'european': {
                 'amount': r'(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?:\s*€|\s*EUR)?',
@@ -160,17 +160,23 @@ class OCRProcessor:
         if any(keyword in text_lower for keyword in gas_keywords):
             return DocumentType.GAS_BILL
         
+        # Detectar tickets de supermercado/tienda
+        supermarket_keywords = ['mercadona', 'carrefour', 'eroski', 'alcampo', 'dia', 'lidl', 
+                               'aldi', 'el corte inglés', 'ticket', 'caja', 'centro', 'op:']
+        ticket_indicators = ['ticket:', 'caja:', 'centro:', 'operador:', 'cajero:', 'precio unidad', 'importe']
+        
+        if (any(keyword in text_lower for keyword in supermarket_keywords) or 
+            any(keyword in text_lower for keyword in ticket_indicators)):
+            return DocumentType.TICKET
+        
         # Otros tipos de documentos
         invoice_keywords = ['factura', 'invoice', 'proforma', 'albaran']
         receipt_keywords = ['recibo', 'receipt', 'justificante', 'comprobante']
-        ticket_keywords = ['ticket', 'tique', 'nota', 'vale']
         
         if any(keyword in text_lower for keyword in invoice_keywords):
             return DocumentType.INVOICE
         elif any(keyword in text_lower for keyword in receipt_keywords):
             return DocumentType.RECEIPT
-        elif any(keyword in text_lower for keyword in ticket_keywords):
-            return DocumentType.TICKET
         else:
             return DocumentType.UNKNOWN
     
@@ -548,6 +554,162 @@ class OCRProcessor:
             logger.warning(f"Error extrayendo texto nativo: {e}")
             return ""
     
+    def extract_ticket_data(self, text: str) -> Dict:
+        """Extrae datos específicos de tickets de compra."""
+        logger.info("Iniciando extracción de datos de ticket")
+        
+        extracted = {
+            'document_type': DocumentType.TICKET.value,
+            'extraction_timestamp': datetime.now().isoformat(),
+            'financial': {},
+            'identification': {},
+            'dates': [],
+            'contacts': {},
+            'items': []
+        }
+        
+        # Patrones específicos para tickets
+        ticket_patterns = {
+            'total_patterns': [
+                r'(?:TOTAL|TOTAL\s*A\s*PAGAR|IMPORTE\s*TOTAL|TOTAL\s*EUROS?)\s*[:\s]*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*[€]?',
+                r'TOTAL\s*[:\s]*(\d+[.,]\d{2})\s*[€]?',
+                r'(?:TOTAL\s*GENERAL|TOTAL\s*FINAL)\s*[:\s]*(\d+[.,]\d{2})\s*[€]?'
+            ],
+            'base_patterns': [
+                r'(?:BASE\s*IMPONIBLE|B\.?\s*IMPONIBLE|BASE\s*IVA|SUBTOTAL)\s*[:\s]*(\d+[.,]\d{2})\s*[€]?',
+                r'(?:SUMA|SUBTOTAL|BASE)\s*[:\s]*(\d+[.,]\d{2})\s*[€]?'
+            ],
+            'iva_patterns': [
+                r'(?:IVA|I\.V\.A\.?)\s*(?:\d+%?)?\s*[:\s]*(\d+[.,]\d{2})\s*[€]?',
+                r'(?:IMPUESTOS|TAX)\s*[:\s]*(\d+[.,]\d{2})\s*[€]?'
+            ],
+            'date_patterns': [
+                r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
+                r'(\d{1,2}\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s+\d{2,4})',
+                r'FECHA[:\s]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})'
+            ],
+            'time_patterns': [
+                r'(\d{1,2}:\d{2}(?::\d{2})?)',
+                r'HORA[:\s]*(\d{1,2}:\d{2})'
+            ],
+            'store_patterns': [
+                r'(MERCADONA|CARREFOUR|ALCAMPO|EROSKI|DIA|LIDL|ALDI|SUPERSOL)',
+                r'^([A-Z\s&]{3,30})\s*(?:S\.?L\.?|S\.?A\.?)?'
+            ]
+        }
+        
+        # Extraer montos financieros
+        totals = []
+        bases = []
+        ivas = []
+        
+        # Buscar totales
+        for pattern in ticket_patterns['total_patterns']:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                amount_str = match.group(1).replace(',', '.')
+                try:
+                    amount = float(amount_str)
+                    totals.append(amount)
+                    logger.info(f"Total encontrado: {amount}")
+                except ValueError:
+                    continue
+        
+        # Buscar bases imponibles
+        for pattern in ticket_patterns['base_patterns']:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                amount_str = match.group(1).replace(',', '.')
+                try:
+                    amount = float(amount_str)
+                    bases.append(amount)
+                    logger.info(f"Base imponible encontrada: {amount}")
+                except ValueError:
+                    continue
+        
+        # Buscar IVA
+        for pattern in ticket_patterns['iva_patterns']:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                amount_str = match.group(1).replace(',', '.')
+                try:
+                    amount = float(amount_str)
+                    ivas.append(amount)
+                    logger.info(f"IVA encontrado: {amount}")
+                except ValueError:
+                    continue
+        
+        # Lógica inteligente para determinar el total correcto
+        final_total = None
+        base_amount = None
+        iva_amount = None
+        
+        if totals and bases:
+            # Si tenemos tanto totales como bases, el total debe ser mayor que la base
+            max_total = max(totals)
+            max_base = max(bases)
+            
+            # Verificar que el total sea mayor que la base (lógica básica)
+            if max_total > max_base:
+                final_total = max_total
+                base_amount = max_base
+            else:
+                # Si no, usar el valor más alto como total
+                final_total = max(max_total, max_base)
+                base_amount = min(max_total, max_base) if len(bases) > 0 else None
+        elif totals:
+            final_total = max(totals)
+        elif bases:
+            # Si solo hay bases, usar la mayor como total (fallback)
+            final_total = max(bases)
+        
+        if ivas:
+            iva_amount = max(ivas)
+        
+        # Validación cruzada: Total = Base + IVA (con tolerancia)
+        if final_total and base_amount and iva_amount:
+            expected_total = base_amount + iva_amount
+            if abs(final_total - expected_total) < 0.02:  # Tolerancia de 2 céntimos
+                logger.info(f"Validación exitosa: {base_amount} + {iva_amount} = {final_total}")
+            else:
+                logger.warning(f"Inconsistencia: {final_total} != {base_amount} + {iva_amount}")
+        
+        # Llenar datos financieros
+        if final_total:
+            extracted['financial']['total_amount'] = final_total
+        if base_amount:
+            extracted['financial']['base_amount'] = base_amount
+        if iva_amount:
+            extracted['financial']['tax_amount'] = iva_amount
+        
+        # Extraer fechas
+        for pattern in ticket_patterns['date_patterns']:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                extracted['dates'].append({
+                    'type': 'transaction_date',
+                    'value': match.group(1)
+                })
+        
+        # Extraer horas
+        for pattern in ticket_patterns['time_patterns']:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                extracted['dates'].append({
+                    'type': 'transaction_time',
+                    'value': match.group(1)
+                })
+        
+        # Extraer nombre de tienda
+        for pattern in ticket_patterns['store_patterns']:
+            match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+            if match:
+                extracted['identification']['store_name'] = match.group(1).strip()
+                break
+        
+        logger.info(f"Datos de ticket extraídos: {extracted}")
+        return extracted
+
     def extract_structured_data(self, text: str, doc_type: DocumentType) -> Dict[str, Any]:
         """Extracción avanzada de datos estructurados"""
         
@@ -555,6 +717,10 @@ class OCRProcessor:
         if doc_type in [DocumentType.ELECTRICITY_BILL, DocumentType.GAS_BILL]:
             return self.extract_electricity_bill_data(text, doc_type)
         
+        # Si es ticket, usar extractor especializado
+        if doc_type == DocumentType.TICKET:
+            return self.extract_ticket_data(text)
+            
         # Para otros tipos de documento, usar el extractor general
         patterns = self.document_patterns['spanish']
         extracted = {
@@ -567,8 +733,11 @@ class OCRProcessor:
             'items': []
         }
         
-        # Extraer datos financieros
-        for key in ['amount', 'total', 'base_amount', 'vat_amount']:
+        # Extraer datos financieros con lógica mejorada
+        financial_data = {}
+        
+        # Extraer todos los importes primero
+        for key in ['total', 'base_amount', 'vat_amount', 'amount']:
             matches = re.findall(patterns.get(key, ''), text, re.IGNORECASE | re.MULTILINE)
             if matches:
                 amounts = []
@@ -578,15 +747,57 @@ class OCRProcessor:
                     # Normalizar formato numérico
                     normalized = match.replace('.', '').replace(',', '.')
                     try:
-                        amounts.append(float(normalized))
+                        amount = float(normalized)
+                        if amount > 0:  # Solo importes positivos
+                            amounts.append(amount)
                     except ValueError:
                         continue
                 
                 if amounts:
-                    if key == 'total':
-                        extracted['financial'][key] = max(amounts)
-                    else:
-                        extracted['financial'][key] = amounts[0] if len(amounts) == 1 else amounts
+                    financial_data[key] = amounts
+        
+        # Lógica inteligente para determinar el total real
+        if 'total' in financial_data and 'base_amount' in financial_data:
+            # Si tenemos tanto total como base imponible
+            totals = financial_data['total']
+            bases = financial_data['base_amount']
+            
+            # El total real debería ser mayor que la base imponible
+            real_total = None
+            for total_candidate in totals:
+                for base_candidate in bases:
+                    if total_candidate > base_candidate:
+                        # Este total es mayor que alguna base, es candidato
+                        if real_total is None or total_candidate > real_total:
+                            real_total = total_candidate
+            
+            if real_total:
+                extracted['financial']['total'] = real_total
+                # La base imponible es la mayor que sea menor que el total
+                for base_candidate in sorted(bases, reverse=True):
+                    if base_candidate < real_total:
+                        extracted['financial']['base_amount'] = base_candidate
+                        break
+            else:
+                # Si no hay lógica clara, usar el mayor total
+                extracted['financial']['total'] = max(totals)
+                extracted['financial']['base_amount'] = max(bases)
+        
+        elif 'total' in financial_data:
+            # Solo tenemos totales
+            extracted['financial']['total'] = max(financial_data['total'])
+        
+        elif 'base_amount' in financial_data:
+            # Solo tenemos base imponible (puede ser que esté mal etiquetado)
+            extracted['financial']['base_amount'] = max(financial_data['base_amount'])
+        
+        # IVA amount
+        if 'vat_amount' in financial_data:
+            extracted['financial']['vat_amount'] = max(financial_data['vat_amount'])
+        
+        # Otros importes generales
+        if 'amount' in financial_data and 'total' not in extracted['financial']:
+            extracted['financial']['amount'] = max(financial_data['amount'])
         
         # Extraer IVA
         vat_rate_matches = re.findall(patterns['vat_rate'], text, re.IGNORECASE)

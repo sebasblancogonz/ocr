@@ -1,13 +1,17 @@
-# Guía de Despliegue - Servicio OCR en VPS
+# 🚀 Guía de Despliegue - Servicio OCR
 
-## Requisitos del VPS
+> **Nota**: Esta guía está actualizada para la versión 2.1.0. Para la documentación completa, ver [README.md](README.md).
 
-- Ubuntu 20.04+ o Debian 11+
-- Mínimo 2GB RAM (recomendado 4GB para OCR)
-- Docker y Docker Compose instalados
-- Puertos 8001 y 80/443 disponibles
+## 📋 Requisitos del VPS
 
-## Opción 1: Despliegue con Docker Compose (Recomendado)
+- **OS**: Ubuntu 20.04+ o Debian 11+
+- **RAM**: Mínimo 2GB (recomendado 4GB para OCR intensivo)
+- **CPU**: 1-2 cores
+- **Storage**: 10GB para aplicación + cache
+- **Docker**: Versión 20.10+
+- **Puertos**: 8001 disponible
+
+## 🐳 Despliegue con Docker (Recomendado)
 
 ### 1. Preparar el VPS
 
