@@ -226,15 +226,25 @@ class OCRProcessor:
         
         if quality == ProcessingQuality.BALANCED:
             # Mejorar contraste adaptativo
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             enhanced = clahe.apply(denoised)
             
-            # Binarización mejorada
-            _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Aplicar filtro bilateral para suavizar manteniendo bordes
+            bilateral = cv2.bilateralFilter(enhanced, 9, 75, 75)
             
-            # Limpieza morfológica
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+            # Binarización adaptativa para mejor manejo de iluminación irregular
+            binary = cv2.adaptiveThreshold(
+                bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # Limpieza morfológica suave
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            
+            # Eliminar ruido pequeño
+            kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean)
             
             return binary
         
@@ -384,19 +394,51 @@ class OCRProcessor:
         if not text:
             return text
             
-        # Reemplazar secuencias de caracteres problemáticos comunes
-        replacements = {
-            r'[^\w\s.,;:!?()[\]{}"\'\-+*/=@#$%&|\\<>^_`~€À-ÿ]': ' ',  # Caracteres no válidos
-            r'\s+': ' ',  # Múltiples espacios
-            r'([A-Za-z])\s+([A-Za-z])(?=\s|$)': r'\1\2',  # Letras separadas por espacios
-            r'(\d)\s+(\d)': r'\1\2',  # Números separados
+        # Paso 1: Limpiar caracteres obviamente incorrectos
+        # Reemplazar secuencias de caracteres no válidos
+        cleaned = re.sub(r'[^\w\s.,;:!?()[\]{}"\'\-+*/=@#$%&|\\<>^_`~€À-ÿñÑ]', ' ', text)
+        
+        # Paso 2: Corregir espaciado
+        cleaned = re.sub(r'\s+', ' ', cleaned)  # Múltiples espacios
+        
+        # Paso 3: Intentar reconstruir palabras separadas incorrectamente
+        # Unir letras sueltas que probablemente son parte de una palabra
+        cleaned = re.sub(r'\b([A-Za-z])\s+([A-Za-z])\s+([A-Za-z])\b', r'\1\2\3', cleaned)
+        cleaned = re.sub(r'\b([A-Za-z])\s+([A-Za-z])\b', r'\1\2', cleaned)
+        
+        # Paso 4: Unir números separados
+        cleaned = re.sub(r'(\d)\s+(\d)', r'\1\2', cleaned)
+        
+        # Paso 5: Eliminar líneas que son principalmente ruido
+        lines = cleaned.split('\n')
+        clean_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if len(line) < 3:  # Líneas muy cortas
+                continue
+                
+            # Calcular ratio de caracteres válidos
+            valid_chars = sum(1 for c in line if c.isalnum() or c.isspace() or c in '.,;:!?()-€')
+            if len(line) > 0 and (valid_chars / len(line)) > 0.6:  # Al menos 60% caracteres válidos
+                clean_lines.append(line)
+        
+        # Paso 6: Intentar identificar patrones comunes de documentos
+        final_text = '\n'.join(clean_lines)
+        
+        # Corregir algunos errores comunes de OCR
+        ocr_corrections = {
+            r'\bO\b': '0',  # O mayúscula que debería ser 0
+            r'\bl\b': '1',  # l minúscula que debería ser 1
+            r'\bS\b': '5',  # S que debería ser 5
+            r'€\s*(\d)': r'€\1',  # Espacios entre € y números
+            r'(\d)\s*€': r'\1€',   # Espacios entre números y €
         }
         
-        cleaned = text
-        for pattern, replacement in replacements.items():
-            cleaned = re.sub(pattern, replacement, cleaned)
+        for pattern, replacement in ocr_corrections.items():
+            final_text = re.sub(pattern, replacement, final_text)
         
-        return cleaned.strip()
+        return final_text.strip()
     
     def extract_text_from_pdf(self, pdf_bytes: bytes, quality: ProcessingQuality = ProcessingQuality.BALANCED) -> Tuple[str, float]:
         """Extraer texto de PDF con procesamiento mejorado"""
@@ -1652,6 +1694,112 @@ async def debug_pdf(file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en debug PDF: {str(e)}")
+
+@app.post("/ocr/enhance")
+async def enhance_and_process(
+    file: UploadFile = File(...),
+    try_all_methods: bool = Query(True, description="Probar todos los métodos de mejoramiento")
+):
+    """
+    Procesar imagen con múltiples técnicas de mejoramiento para imágenes de baja calidad
+    """
+    
+    if not file.content_type or not file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="Solo se admiten imágenes")
+    
+    try:
+        content = await file.read()
+        image = Image.open(io.BytesIO(content))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+        
+        # Diferentes técnicas de mejoramiento
+        enhancement_methods = {
+            'original': gray,
+            'histogram_equalization': cv2.equalizeHist(gray),
+            'clahe': cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(gray),
+            'bilateral_filter': cv2.bilateralFilter(gray, 9, 75, 75),
+            'gaussian_blur': cv2.GaussianBlur(gray, (3, 3), 0),
+            'median_filter': cv2.medianFilter(gray, 3),
+        }
+        
+        # Si la imagen es pequeña, redimensionar
+        if image.size[0] < 600 or image.size[1] < 600:
+            scale = max(800/image.size[0], 800/image.size[1])
+            new_size = (int(image.size[0] * scale), int(image.size[1] * scale))
+            resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+            opencv_resized = cv2.cvtColor(np.array(resized_image), cv2.COLOR_RGB2BGR)
+            gray_resized = cv2.cvtColor(opencv_resized, cv2.COLOR_BGR2GRAY)
+            enhancement_methods['upscaled'] = gray_resized
+        
+        results = {}
+        best_result = None
+        best_score = 0
+        
+        for method_name, processed_image in enhancement_methods.items():
+            try:
+                # Probar diferentes configuraciones PSM para cada método
+                psm_configs = [6, 3, 8, 7] if try_all_methods else [6]
+                
+                method_results = []
+                
+                for psm in psm_configs:
+                    config = f'--oem 3 --psm {psm} -l {TESSERACT_LANGUAGES}'
+                    
+                    try:
+                        text = pytesseract.image_to_string(processed_image, config=config)
+                        
+                        if text and len(text.strip()) > 0:
+                            # Calcular score basado en longitud y caracteres válidos
+                            cleaned_text = ocr_processor._clean_extracted_text(text)
+                            valid_chars = sum(1 for c in cleaned_text if c.isalnum() or c.isspace())
+                            score = len(cleaned_text) * (valid_chars / len(cleaned_text) if cleaned_text else 0)
+                            
+                            method_results.append({
+                                'psm': psm,
+                                'raw_text': text[:200] + "..." if len(text) > 200 else text,
+                                'cleaned_text': cleaned_text[:200] + "..." if len(cleaned_text) > 200 else cleaned_text,
+                                'text_length': len(cleaned_text),
+                                'score': round(score, 2)
+                            })
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_result = {
+                                    'method': method_name,
+                                    'psm': psm,
+                                    'text': cleaned_text,
+                                    'score': score
+                                }
+                    except:
+                        continue
+                
+                if method_results:
+                    # Ordenar por score y tomar el mejor
+                    method_results.sort(key=lambda x: x['score'], reverse=True)
+                    results[method_name] = method_results[0] if not try_all_methods else method_results
+                        
+            except Exception as e:
+                results[method_name] = {'error': str(e)}
+        
+        return {
+            'filename': file.filename,
+            'original_size': image.size,
+            'methods_tested': list(enhancement_methods.keys()),
+            'results': results,
+            'best_result': best_result,
+            'recommendations': {
+                'low_quality_detected': best_score < 100,
+                'text_found': best_score > 0,
+                'suggested_method': best_result['method'] if best_result else 'none'
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en mejoramiento: {str(e)}")
 
 @app.post("/ocr/debug")
 async def debug_ocr(
